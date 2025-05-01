@@ -9,6 +9,7 @@ use bytemuck::Pod;
 use bytemuck::Zeroable;
 use std::ffi::OsStr;
 use std::ops::Range;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 
@@ -268,7 +269,10 @@ impl<'data> Identifier<'data> {
     }
 
     pub(crate) fn as_path(&self) -> &'data std::path::Path {
-        Path::new(OsStr::from_bytes(self.as_slice()))
+        #[cfg(unix)]
+        return Path::new(OsStr::from_bytes(self.as_slice()));
+        #[cfg(windows)]
+        return Path::new(unsafe { OsStr::from_encoded_bytes_unchecked(self.as_slice()) });
     }
 }
 
