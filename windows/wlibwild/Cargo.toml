@@ -8,6 +8,15 @@ rust-version.workspace = true
 edition.workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
+bytemuck = { workspace = true }
+bytesize = { workspace = true }
+colored = { workspace = true }
+indexmap = { workspace = true }
+itertools = { workspace = true }
+rayon = { workspace = true }
+tracing = { workspace = true }
+object = { workspace = true }
 
 [lints]
 workspace = true

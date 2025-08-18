@@ -60,6 +60,7 @@ object = { version = "0.37.3", default-features = false, features = [
     "std",
     "unaligned",
     "archive",
+    "pe",
 ] }
 os_info = "3.0.0"
 perf-event = "0.4.8"

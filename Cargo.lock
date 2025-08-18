@@ -1903,6 +1903,17 @@ dependencies = [
 [[package]]
 name = "wlibwild"
 version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "bytesize",
+ "colored",
+ "indexmap",
+ "itertools",
+ "object 0.37.3",
+ "rayon",
+ "tracing",
+]
 
 [[package]]
 name = "zlib-rs"
