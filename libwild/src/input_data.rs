@@ -25,6 +25,7 @@ use rayon::iter::ParallelIterator;
 use std::ffi::OsStr;
 use std::fmt::Display;
 use std::ops::Deref;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -339,8 +340,14 @@ impl<'data> InputData<'data> {
     }
 
     pub(crate) fn has_file(&self, name: &'data [u8]) -> bool {
-        self.path_to_load_index
-            .contains_key(Path::new(OsStr::from_bytes(name)))
+        self.path_to_load_index.contains_key(Path::new({
+            unsafe {
+                #[cfg(windows)]
+                OsStr::from_encoded_bytes_unchecked(name)
+            }
+            #[cfg(unix)]
+            OsStr::from_bytes(name)
+        }))
     }
 }
 

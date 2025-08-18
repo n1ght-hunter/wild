@@ -231,6 +231,15 @@ impl SaveDirState {
                 self.copy_file(&absolute_target)?;
             }
 
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(&target, &dest_path).with_context(|| {
+                format!(
+                    "Failed to symlink {} to {}",
+                    dest_path.display(),
+                    target.display()
+                )
+            })?;
+            #[cfg(unix)]
             std::os::unix::fs::symlink(&target, &dest_path).with_context(|| {
                 format!(
                     "Failed to symlink {} to {}",

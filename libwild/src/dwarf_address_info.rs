@@ -13,6 +13,7 @@ use object::read::elf::RelocationSections;
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::fmt::Display;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -64,7 +65,17 @@ pub(crate) fn get_source_info<A: Arch>(
         let comp_dir = unit
             .comp_dir
             .as_ref()
-            .map(|dir| Path::new(OsStr::from_bytes(dir)).to_owned())
+            .map(|dir| {
+                Path::new({
+                    unsafe {
+                        #[cfg(windows)]
+                        OsStr::from_encoded_bytes_unchecked(dir)
+                    }
+                    #[cfg(unix)]
+                    OsStr::from_bytes(dir)
+                })
+                .to_owned()
+            })
             .unwrap_or_default();
 
         let mut rows = program.rows();
@@ -82,9 +93,15 @@ pub(crate) fn get_source_info<A: Arch>(
             if let Some(file) = row.file(header) {
                 path = comp_dir.clone();
 
-                path.push(OsStr::from_bytes(
-                    &dwarf.attr_string(&unit, file.path_name())?,
-                ));
+                let file_path_name = dwarf.attr_string(&unit, file.path_name())?;
+                path.push({
+                    unsafe {
+                        #[cfg(windows)]
+                        OsStr::from_encoded_bytes_unchecked(&file_path_name)
+                    }
+                    #[cfg(unix)]
+                    OsStr::from_bytes(&file_path_name)
+                });
             }
 
             let line = row.line().map_or(0, |l| l.get());

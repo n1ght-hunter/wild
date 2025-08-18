@@ -213,26 +213,35 @@ impl Output {
 
 /// Returns the file write mode that we should use to write to the specified path.
 fn default_file_write_mode(path: &Path) -> FileWriteMode {
-    use std::os::unix::fs::FileTypeExt as _;
-
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return FileWriteMode::UnlinkAndReplace;
-    };
-
-    let file_type = metadata.file_type();
-
-    // If we've been asked to write to a path that currently holds some exotic kind of file, then we
-    // don't want to delete it, even if we have permission to. For example, we don't want to delete
-    // `/dev/null` if we're running in a container as root.
-    if file_type.is_char_device()
-        || file_type.is_block_device()
-        || file_type.is_socket()
-        || file_type.is_fifo()
+    #[cfg(windows)]
     {
-        return FileWriteMode::UpdateInPlace;
+        let _ = path;
+        FileWriteMode::UnlinkAndReplace
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
 
-    FileWriteMode::UnlinkAndReplace
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return FileWriteMode::UnlinkAndReplace;
+        };
+
+        let file_type = metadata.file_type();
+
+        // If we've been asked to write to a path that currently holds some exotic kind of file, then we
+        // don't want to delete it, even if we have permission to. For example, we don't want to delete
+        // `/dev/null` if we're running in a container as root.
+        #[cfg(unix)]
+        if file_type.is_char_device()
+            || file_type.is_block_device()
+            || file_type.is_socket()
+            || file_type.is_fifo()
+        {
+            return FileWriteMode::UpdateInPlace;
+        }
+
+        FileWriteMode::UnlinkAndReplace
+    }
 }
 
 /// Delete the old output file. Note, this is only used when running from a single thread.
@@ -260,6 +269,7 @@ impl SizedOutput {
         // unless and until the subprocess calls exec, it will inherit the file descriptor. However,
         // assuming it eventually calls exec, this at least means that it inherits the file
         // descriptor for less time. i.e. this doesn't really fix anything, but makes problems less bad.
+        #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open_options, libc::O_CLOEXEC);
 
         match write_mode {
