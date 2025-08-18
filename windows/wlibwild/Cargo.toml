@@ -17,6 +17,7 @@ itertools = { workspace = true }
 rayon = { workspace = true }
 tracing = { workspace = true }
 object = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["ansi"]}
 
 [lints]
 workspace = true
