@@ -2,23 +2,28 @@
 //! information about where each symbol can be obtained.
 
 use crate::InputLinkerScript;
+use crate::args;
 use crate::args::Args;
-use crate::args::OutputKind;
+use crate::bail;
+use crate::error::Context as _;
+use crate::error::Error;
 use crate::error::Result;
+use crate::export_list::ExportList;
 use crate::grouping::Group;
+use crate::grouping::SequencedInput;
+use crate::grouping::SequencedInputObject;
+use crate::grouping::SequencedLinkerScript;
 use crate::hash::PassThroughHashMap;
 use crate::hash::PreHashed;
 use crate::hash::hash_bytes;
 use crate::input_data::FileId;
 use crate::input_data::PRELUDE_FILE_ID;
-use crate::input_data::UNINITIALISED_FILE_ID;
-use crate::input_data::VersionScriptData;
+use crate::input_data::ScriptData;
 use crate::output_section_id::OutputSectionId;
 use crate::parsing::InternalSymDefInfo;
-use crate::parsing::ParsedInput;
-use crate::parsing::ParsedInputObject;
 use crate::parsing::Prelude;
-use crate::parsing::ProcessedLinkerScript;
+use crate::parsing::SymbolPlacement;
+use crate::resolution::AtomicValueFlags;
 use crate::resolution::ResolvedFile;
 use crate::resolution::ResolvedGroup;
 use crate::resolution::ValueFlags;
@@ -27,9 +32,6 @@ use crate::symbol::PreHashedSymbolName;
 use crate::symbol::UnversionedSymbolName;
 use crate::symbol::VersionedSymbolName;
 use crate::version_script::VersionScript;
-use anyhow::Context;
-use anyhow::Error;
-use anyhow::bail;
 use crossbeam_queue::SegQueue;
 use foldhash::HashMap;
 use foldhash::fast::RandomState;
@@ -46,6 +48,8 @@ use std::collections::hash_map;
 use std::fmt::Display;
 use std::mem::replace;
 use std::mem::take;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 use symbolic_demangle::demangle;
 
 pub struct SymbolDb<'data> {
@@ -76,9 +80,20 @@ pub struct SymbolDb<'data> {
     start_stop_symbol_names: Vec<UnversionedSymbolName<'data>>,
 
     pub(crate) version_script: VersionScript<'data>,
+    pub(crate) export_list: Option<ExportList<'data>>,
 
     /// The name of the entry symbol if overridden by a linker script.
     entry: Option<&'data [u8]>,
+}
+
+/// Borrows from a SymbolDb, but allows temporary atomic access to some of the tables. These tables
+/// are returned to the original SymbolDb when the AtomicSymbolDb is dropped. If the AtomicSymbolDb
+/// gets leaked, then the tables in the original SymbolDb will remain empty. Provides some, but not
+/// all of the APIs provided by SymbolDb.
+struct AtomicSymbolDb<'data, 'db> {
+    db: &'db mut SymbolDb<'data>,
+    definitions: Vec<AtomicSymbolId>,
+    symbol_value_flags: Vec<AtomicValueFlags>,
 }
 
 struct SymbolBucket<'data> {
@@ -116,6 +131,8 @@ struct PendingVersionedSymbol<'data> {
 /// symbol ID 0 is reserved for the undefined symbol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SymbolId(u32);
+
+struct AtomicSymbolId(AtomicU32);
 
 /// A range of symbol IDs that are defined by the same input file.
 ///
@@ -162,10 +179,6 @@ impl SymbolIdRange {
 
     pub(crate) fn start(&self) -> SymbolId {
         self.start_symbol_id
-    }
-
-    pub(crate) fn set_start(&mut self, start: SymbolId) {
-        self.start_symbol_id = start;
     }
 
     pub(crate) fn as_usize(&self) -> std::ops::Range<usize> {
@@ -265,14 +278,22 @@ impl<'data> SymbolDb<'data> {
     #[tracing::instrument(skip_all, name = "Build symbol DB")]
     pub fn build(
         groups: Vec<Group<'data>>,
-        version_script_data: Option<VersionScriptData<'data>>,
+        version_script_data: Option<ScriptData<'data>>,
         args: &'data Args,
         linker_scripts: &[InputLinkerScript<'data>],
+        herd: &'data bumpalo_herd::Herd,
+        export_list_data: Option<ScriptData<'data>>,
     ) -> Result<Self> {
         let version_script = version_script_data
             .map(VersionScript::parse)
             .transpose()?
             .unwrap_or_default();
+        let mut export_list = export_list_data.map(ExportList::parse).transpose()?;
+        for symbol in &args.export_list {
+            export_list
+                .get_or_insert_default()
+                .add_symbol(symbol, true)?;
+        }
 
         let num_symbols_per_group = groups.iter().map(|g| g.num_symbols()).collect_vec();
 
@@ -301,8 +322,13 @@ impl<'data> SymbolDb<'data> {
             })
             .collect_vec();
 
-        let per_group_outputs =
-            read_symbols(&groups, &version_script, &mut per_group_writers, args)?;
+        let per_group_outputs = read_symbols(
+            &groups,
+            &version_script,
+            &mut per_group_writers,
+            args,
+            &export_list,
+        )?;
 
         for writer in per_group_writers {
             symbol_definitions_writer.return_shard(writer.resolutions);
@@ -335,10 +361,13 @@ impl<'data> SymbolDb<'data> {
             start_stop_symbol_names: Default::default(),
             symbol_value_flags,
             version_script,
+            export_list,
             entry: None,
         };
 
         index.populate_symbol_db(&per_group_outputs)?;
+
+        index.apply_wrapped_symbol_overrides(args, herd);
 
         for script in linker_scripts {
             index.apply_linker_script(script);
@@ -400,6 +429,49 @@ impl<'data> SymbolDb<'data> {
         symbol_id
     }
 
+    /// Applies overrides for symbols wrapped via the --wrap= argument. Note that like GNU ld, our
+    /// wrapping mechanism only affects resolution of undefined symbols. Defined symbols will be
+    /// unaffected. This means that references to a symbol from within the compilation unit that
+    /// defines it will not go via the wrapper. This is in contrast to LLD where wrapping also
+    /// affects references to symbols in compilation units where those symbols are defined. Our main
+    /// reason for this choice of behaviour is that it's much simpler to implement.
+    fn apply_wrapped_symbol_overrides(&mut self, args: &Args, herd: &'data bumpalo_herd::Herd) {
+        if args.wrap.is_empty() {
+            return;
+        }
+
+        let allocator = herd.get();
+
+        for name in &args.wrap {
+            let wrap_name = format!("__wrap_{name}");
+            let Some(wrap_id) =
+                self.get_unversioned(&UnversionedSymbolName::prehashed(wrap_name.as_bytes()))
+            else {
+                continue;
+            };
+
+            let name_bytes = allocator.alloc_slice_copy(name.as_bytes());
+            let orig_id = self.override_name(UnversionedSymbolName::prehashed(name_bytes), wrap_id);
+
+            if let Some(orig_id) = orig_id {
+                let real_name = allocator.alloc_slice_copy(format!("__real_{name}").as_bytes());
+                self.override_name(UnversionedSymbolName::prehashed(real_name), orig_id);
+            }
+        }
+    }
+
+    /// Overrides `name` to point to `symbol_id`. Returns the old symbol ID for `name`.
+    fn override_name(
+        &mut self,
+        name: PreHashed<UnversionedSymbolName<'data>>,
+        symbol_id: SymbolId,
+    ) -> Option<SymbolId> {
+        let num_buckets = self.buckets.len();
+        self.buckets[name.hash() as usize % num_buckets]
+            .name_to_id
+            .insert(name, symbol_id)
+    }
+
     /// Reads the symbol visibility from the original object.
     fn input_symbol_visibility(&self, symbol_id: SymbolId) -> Visibility {
         let file_id = self.file_id_for_symbol(symbol_id);
@@ -409,7 +481,7 @@ impl<'data> SymbolDb<'data> {
                 let obj = &parsed_input_objects[file_id.file()];
                 let local_index = symbol_id.to_input(obj.symbol_id_range);
 
-                let Ok(obj_symbol) = obj.object.symbol(local_index) else {
+                let Ok(obj_symbol) = obj.parsed.object.symbol(local_index) else {
                     return Visibility::Default;
                 };
 
@@ -442,7 +514,7 @@ impl<'data> SymbolDb<'data> {
     pub(crate) fn symbol_name(&self, symbol_id: SymbolId) -> Result<UnversionedSymbolName<'data>> {
         let file_id = self.file_id_for_symbol(symbol_id);
         match &self.groups[file_id.group()] {
-            Group::Prelude(prelude) => Ok(prelude.symbol_name(symbol_id, self.args.output_kind())),
+            Group::Prelude(prelude) => Ok(prelude.symbol_name(symbol_id)),
             Group::Objects(parsed_input_objects) => {
                 parsed_input_objects[file_id.file()].symbol_name(symbol_id)
             }
@@ -514,6 +586,25 @@ impl<'data> SymbolDb<'data> {
         self.symbol_definitions = definitions;
     }
 
+    fn borrow_atomic<'db>(&'db mut self) -> AtomicSymbolDb<'data, 'db> {
+        let definitions = self
+            .take_definitions()
+            .into_iter()
+            .map(|id| id.as_atomic())
+            .collect();
+
+        let value_flags = take(&mut self.symbol_value_flags)
+            .into_iter()
+            .map(|flags| flags.as_atomic())
+            .collect();
+
+        AtomicSymbolDb {
+            db: self,
+            definitions,
+            symbol_value_flags: value_flags,
+        }
+    }
+
     pub(crate) fn file_id_for_symbol(&self, symbol_id: SymbolId) -> FileId {
         self.symbol_file_ids
             .get(symbol_id.as_usize())
@@ -542,14 +633,14 @@ impl<'data> SymbolDb<'data> {
         self.symbol_definitions[symbol_id.as_usize()] = new_definition;
     }
 
-    pub(crate) fn file(&self, file_id: FileId) -> ParsedInput {
+    pub(crate) fn file<'db>(&'db self, file_id: FileId) -> SequencedInput<'db> {
         match &self.groups[file_id.group()] {
-            Group::Prelude(prelude) => ParsedInput::Prelude(prelude),
+            Group::Prelude(prelude) => SequencedInput::Prelude(prelude),
             Group::Objects(parsed_input_objects) => {
-                ParsedInput::Object(&parsed_input_objects[file_id.file()])
+                SequencedInput::Object(&parsed_input_objects[file_id.file()])
             }
-            Group::LinkerScripts(scripts) => ParsedInput::LinkerScript(&scripts[file_id.file()]),
-            Group::Epilogue(epilogue) => ParsedInput::Epilogue(epilogue),
+            Group::LinkerScripts(scripts) => SequencedInput::LinkerScript(&scripts[file_id.file()]),
+            Group::Epilogue(epilogue) => SequencedInput::Epilogue(epilogue),
         }
     }
 
@@ -592,7 +683,7 @@ impl<'data> SymbolDb<'data> {
 
     pub(crate) fn all_unversioned_symbols(
         &self,
-    ) -> impl Iterator<Item = (&PreHashed<UnversionedSymbolName>, &SymbolId)> {
+    ) -> impl Iterator<Item = (&PreHashed<UnversionedSymbolName<'data>>, &SymbolId)> {
         self.buckets.iter().flat_map(|b| b.name_to_id.iter())
     }
 
@@ -709,34 +800,28 @@ pub(crate) fn resolve_alternative_symbol_definitions<'data>(
     resolved: &[ResolvedGroup],
 ) -> Result {
     let mut buckets = take(&mut symbol_db.buckets);
+    let atomic_symbol_db = symbol_db.borrow_atomic();
     let error_queue = SegQueue::new();
 
-    let replacements: Vec<Vec<SymbolReplacement>> = buckets
-        .par_iter_mut()
-        .map(|bucket| {
-            let mut local_replacements = Vec::new();
+    buckets.par_iter_mut().for_each(|bucket| {
+        process_alternatives(
+            &mut bucket.alternative_definitions,
+            &error_queue,
+            &atomic_symbol_db,
+            resolved,
+        );
 
-            process_alternatives(
-                &mut bucket.alternative_definitions,
-                &mut local_replacements,
-                &error_queue,
-                symbol_db,
-                resolved,
-            );
+        process_alternatives(
+            &mut bucket.alternative_versioned_definitions,
+            &error_queue,
+            &atomic_symbol_db,
+            resolved,
+        );
+    });
 
-            process_alternatives(
-                &mut bucket.alternative_versioned_definitions,
-                &mut local_replacements,
-                &error_queue,
-                symbol_db,
-                resolved,
-            );
+    drop(atomic_symbol_db);
 
-            local_replacements
-        })
-        .collect();
-
-    let mut duplicate_errors: Vec<anyhow::Error> = error_queue.into_iter().collect();
+    let mut duplicate_errors: Vec<Error> = error_queue.into_iter().collect();
     duplicate_errors.sort_by_key(|e| e.to_string());
 
     if !duplicate_errors.is_empty() {
@@ -745,38 +830,13 @@ pub(crate) fn resolve_alternative_symbol_definitions<'data>(
             .map(|e| e.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        return Err(anyhow::Error::msg(format!(
-            "Duplicate symbols detected: {error_details}"
-        )));
-    }
 
-    for r in replacements.iter().flat_map(|r| r.iter()) {
-        // TODO: Currently we only make the symbol non-interposable, but we should also actually
-        // change its visibility too. We need somewhere to store this information. We also need
-        // linker-diff to report when we get exported dynamic symbols wrong.
-        if r.visibility != Visibility::Default {
-            let value_flags = &mut symbol_db.symbol_value_flags[r.replace.as_usize()];
-            if !value_flags.contains(ValueFlags::DYNAMIC) {
-                *value_flags |= ValueFlags::NON_INTERPOSABLE;
-            }
-        }
-        symbol_db.replace_definition(r.replace, r.selected);
+        bail!("Duplicate symbols detected: {error_details}");
     }
 
     symbol_db.buckets = buckets;
 
     Ok(())
-}
-
-#[derive(Clone, Copy)]
-struct SymbolReplacement {
-    /// The symbol to be replaced.
-    replace: SymbolId,
-
-    /// The symbol that was selected as the definition to use.
-    selected: SymbolId,
-
-    visibility: Visibility,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -788,9 +848,8 @@ enum Visibility {
 
 fn process_alternatives(
     alternative_definitions: &mut HashMap<SymbolId, Vec<SymbolId>>,
-    local_replacements: &mut Vec<SymbolReplacement>,
     error_queue: &SegQueue<Error>,
-    symbol_db: &SymbolDb,
+    symbol_db: &AtomicSymbolDb,
     resolved: &[ResolvedGroup],
 ) {
     for (first, alternatives) in replace(
@@ -809,18 +868,18 @@ fn process_alternatives(
 
         match select_symbol(symbol_db, first, &alternatives, resolved) {
             Ok(selected) => {
-                local_replacements.push(SymbolReplacement {
-                    replace: first,
-                    selected,
-                    visibility,
-                });
+                symbol_db.update_definition(first, selected);
 
-                for alt in alternatives {
-                    local_replacements.push(SymbolReplacement {
-                        replace: alt,
-                        selected,
-                        visibility,
-                    });
+                for &alt in &alternatives {
+                    symbol_db.update_definition(alt, selected);
+                }
+
+                if visibility != Visibility::Default {
+                    symbol_db.handle_non_default_visibility(first);
+
+                    for alt in alternatives {
+                        symbol_db.handle_non_default_visibility(alt);
+                    }
                 }
             }
             Err(err) => {
@@ -830,54 +889,62 @@ fn process_alternatives(
     }
 }
 
-/// Selects which version of the symbol to use.
+/// Selects which version of the symbol to use. For more information on symbol priority, see
+/// https://maskray.me/blog/2021-06-20-linker-symbol-resolution
 #[inline(always)]
 fn select_symbol(
-    symbol_db: &SymbolDb,
-    symbol_id: SymbolId,
+    symbol_db: &AtomicSymbolDb,
+    first_id: SymbolId,
     alternatives: &[SymbolId],
     resolved: &[ResolvedGroup],
-) -> Result<SymbolId, anyhow::Error> {
+) -> Result<SymbolId> {
     let mut max_common = None;
     let mut strong_symbol = None;
+    let mut first_weak = None;
 
-    let all_symbols = std::iter::once(symbol_id).chain(alternatives.iter().copied());
-
-    for alt in all_symbols {
-        if symbol_db.symbol_value_flags(alt).is_dynamic() {
+    for id in std::iter::once(first_id).chain(alternatives.iter().copied()) {
+        // Dynamic symbols, even strong ones, don't override non-dynamic weak symbols, so in this
+        // first pass, we ignore dynamic symbols.
+        if symbol_db.local_symbol_value_flags(id).is_dynamic() {
             continue;
         }
 
-        let strength = symbol_db.symbol_strength(alt, resolved);
+        let strength = symbol_db.symbol_strength(id, resolved);
         match strength {
             SymbolStrength::Strong => {
                 if let Some(existing) = strong_symbol {
                     // We don't implement full COMDAT logic, however if we encounter duplicate
                     // strong definitions, then we don't emit errors if all the strong definitions
                     // are defined in COMDAT group sections.
-                    if !symbol_db.is_in_comdat_group(existing, resolved)
-                        || !symbol_db.is_in_comdat_group(alt, resolved)
+                    if (!symbol_db.is_in_comdat_group(existing, resolved)
+                        || !symbol_db.is_in_comdat_group(id, resolved))
+                        && !symbol_db.db.args.allow_multiple_definitions
                     {
                         bail!(
                             "{}, defined in {} and {}",
-                            symbol_db.symbol_name_for_display(symbol_id),
+                            symbol_db.symbol_name_for_display(first_id),
                             symbol_db.file(symbol_db.file_id_for_symbol(existing)),
-                            symbol_db.file(symbol_db.file_id_for_symbol(alt)),
+                            symbol_db.file(symbol_db.file_id_for_symbol(id)),
                         );
                     }
                 } else {
-                    strong_symbol = Some(alt);
+                    strong_symbol = Some(id);
+                }
+            }
+            SymbolStrength::Weak | SymbolStrength::GnuUnique => {
+                if first_weak.is_none() {
+                    first_weak = Some(id);
                 }
             }
             SymbolStrength::Common(size) => {
-                if let Some((previous_size, _)) = max_common {
-                    if size <= previous_size {
-                        continue;
-                    }
+                if let Some((previous_size, _)) = max_common
+                    && size <= previous_size
+                {
+                    continue;
                 }
-                max_common = Some((size, alt));
+                max_common = Some((size, id));
             }
-            _ => {}
+            SymbolStrength::Undefined => {}
         }
     }
 
@@ -889,19 +956,21 @@ fn select_symbol(
         return Ok(alt);
     }
 
-    let first_strength = symbol_db.symbol_strength(symbol_id, resolved);
-    if first_strength != SymbolStrength::Undefined {
-        return Ok(symbol_id);
+    if let Some(id) = first_weak {
+        return Ok(id);
     }
 
-    for &alt in alternatives.iter().rev() {
+    // If we've made it this far, then the symbol is only defined in shared objects. Pick the first
+    // definition. Note, we don't check for duplicate strong definitions here because it's OK for
+    // multiple shared objects to define the same symbol strongly.
+    for alt in std::iter::once(first_id).chain(alternatives.iter().copied()) {
         let strength = symbol_db.symbol_strength(alt, resolved);
         if strength != SymbolStrength::Undefined {
             return Ok(alt);
         }
     }
 
-    Ok(symbol_id)
+    Ok(first_id)
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -930,11 +999,12 @@ pub(crate) fn is_mapping_symbol_name(name: &[u8]) -> bool {
 }
 
 #[tracing::instrument(skip_all, name = "Read symbols")]
-fn read_symbols<'data, 'out>(
+fn read_symbols<'data>(
     groups: &[Group<'data>],
     version_script: &VersionScript,
     symbols_out_by_group: &mut [SymbolInfoWriter],
     args: &Args,
+    export_list: &Option<ExportList<'data>>,
 ) -> Result<Vec<SymbolLoadOutputs<'data>>> {
     let num_buckets = num_symbol_hash_buckets(args);
 
@@ -948,7 +1018,7 @@ fn read_symbols<'data, 'out>(
 
             match group {
                 Group::Prelude(prelude) => {
-                    prelude.load_symbols(symbols_out, &mut outputs, args.output_kind());
+                    prelude.load_symbols(symbols_out, &mut outputs);
                 }
                 Group::Objects(parsed_input_objects) => {
                     for obj in *parsed_input_objects {
@@ -958,8 +1028,11 @@ fn read_symbols<'data, 'out>(
                             symbols_out,
                             &mut outputs,
                             args,
+                            export_list,
                         )
-                        .with_context(|| format!("Failed to load symbols from `{}`", obj.input))?;
+                        .with_context(|| {
+                            format!("Failed to load symbols from `{}`", obj.parsed.input)
+                        })?;
                     }
                 }
                 Group::LinkerScripts(scripts) => {
@@ -978,16 +1051,19 @@ fn read_symbols<'data, 'out>(
 }
 
 fn load_linker_script_symbols<'data>(
-    script: &ProcessedLinkerScript<'data>,
+    script: &SequencedLinkerScript<'data>,
     symbols_out: &mut SymbolInfoWriter,
     outputs: &mut SymbolLoadOutputs<'data>,
 ) {
-    for (offset, name) in script.symbol_names.iter().enumerate() {
+    for (offset, definition) in script.parsed.symbol_defs.iter().enumerate() {
         let symbol_id = script.symbol_id_range.offset_to_id(offset);
 
         outputs.add_non_versioned(PendingSymbol::from_prehashed(
             symbol_id,
-            PreHashed::new(*name, hash_bytes(name.bytes())),
+            PreHashed::new(
+                UnversionedSymbolName::new(definition.name),
+                hash_bytes(definition.name),
+            ),
         ));
 
         symbols_out.set_next(
@@ -999,54 +1075,29 @@ fn load_linker_script_symbols<'data>(
 }
 
 fn load_symbols_from_file<'data>(
-    s: &ParsedInputObject<'data>,
+    s: &SequencedInputObject<'data>,
     version_script: &VersionScript,
     symbols_out: &mut SymbolInfoWriter,
     outputs: &mut SymbolLoadOutputs<'data>,
     args: &Args,
+    export_list: &Option<ExportList<'data>>,
 ) -> Result {
     if s.is_dynamic() {
-        DynamicObjectSymbolLoader::new(&s.object)?.load_symbols(s.file_id, symbols_out, outputs)
+        DynamicObjectSymbolLoader::new(&s.parsed.object)?.load_symbols(
+            s.file_id,
+            symbols_out,
+            outputs,
+        )
     } else {
         RegularObjectSymbolLoader {
-            object: &s.object,
+            object: &s.parsed.object,
             args,
             version_script,
+            archive_semantics: s.parsed.input.has_archive_semantics(),
+            export_list,
         }
         .load_symbols(s.file_id, symbols_out, outputs)
     }
-}
-
-fn value_flags_from_elf_symbol(sym: &crate::elf::Symbol, args: &Args) -> ValueFlags {
-    let is_undefined = sym.is_undefined(LittleEndian);
-
-    let non_interposable = sym.st_visibility() != object::elf::STV_DEFAULT
-        || sym.is_local()
-        || args.output_kind().is_static_executable()
-        // Symbols defined in an executable cannot be interposed since the executable is always the
-        // first place checked for a symbol by the dynamic loader.
-        || (args.output_kind().is_executable() && !is_undefined);
-
-    let mut flags: ValueFlags = if sym.is_absolute(LittleEndian) {
-        ValueFlags::ABSOLUTE
-    } else if sym.st_type() == object::elf::STT_GNU_IFUNC {
-        ValueFlags::IFUNC
-    } else if is_undefined {
-        if non_interposable {
-            ValueFlags::ABSOLUTE
-        } else {
-            // If we can't bypass the GOT, then an undefined symbol might be able to be defined at
-            // runtime by a dynamic library that gets loaded.
-            ValueFlags::DYNAMIC | ValueFlags::ABSOLUTE
-        }
-    } else {
-        ValueFlags::ADDRESS
-    };
-
-    if non_interposable {
-        flags |= ValueFlags::NON_INTERPOSABLE;
-    }
-    flags
 }
 
 struct SymbolInfoWriter<'out> {
@@ -1072,7 +1123,6 @@ impl<'out> SymbolInfoWriter<'out> {
     }
 
     fn set_next(&mut self, value_flags: ValueFlags, resolution: SymbolId, file_id: FileId) {
-        debug_assert!(file_id != UNINITIALISED_FILE_ID);
         self.value_kinds.push(value_flags);
         self.resolutions.push(resolution);
         self.file_ids.push(file_id);
@@ -1171,6 +1221,8 @@ struct RegularObjectSymbolLoader<'a, 'data> {
     object: &'a crate::elf::File<'data>,
     args: &'a Args,
     version_script: &'a VersionScript<'a>,
+    archive_semantics: bool,
+    export_list: &'a Option<ExportList<'a>>,
 }
 
 struct DynamicObjectSymbolLoader<'a, 'data> {
@@ -1215,8 +1267,69 @@ impl<'a, 'data> DynamicObjectSymbolLoader<'a, 'data> {
 }
 
 impl<'data> SymbolLoader<'data> for RegularObjectSymbolLoader<'_, 'data> {
-    fn compute_value_flags(&self, symbol: &crate::elf::Symbol) -> ValueFlags {
-        value_flags_from_elf_symbol(symbol, self.args)
+    fn compute_value_flags(&self, sym: &crate::elf::Symbol) -> ValueFlags {
+        let is_undefined = sym.is_undefined(LittleEndian);
+
+        let symbol_is_exported = || {
+            if let Some(export_list) = &self.export_list
+                && let Ok(symbol_name) = self.object.symbol_name(sym)
+                && !&export_list.contains(&UnversionedSymbolName::prehashed(symbol_name))
+            {
+                return false;
+            }
+            true
+        };
+        let non_interposable = sym.st_visibility() != object::elf::STV_DEFAULT
+            || sym.is_local()
+            || self.args.output_kind().is_static_executable()
+            // Symbols defined in an executable cannot be interposed since the executable is always the
+            // first place checked for a symbol by the dynamic loader.
+            || (!is_undefined && (
+                self.args.output_kind().is_executable()
+                || (self.args.exclude_libs && self.archive_semantics)
+                || (
+                    self.args.b_symbolic == args::BSymbolicKind::All
+                    // `-Bsymbolic-functions`
+                    || (
+                        self.args.b_symbolic == args::BSymbolicKind::Functions
+                        && sym.st_type() == object::elf::STT_FUNC
+                    )
+                    // `-Bsymbolic-non-weak`
+                    || (
+                        self.args.b_symbolic == args::BSymbolicKind::NonWeak
+                        && sym.st_bind() != object::elf::STB_WEAK
+                    )
+                    // `-Bsymbolic-non-weak-functions`
+                    || (
+                        self.args.b_symbolic == args::BSymbolicKind::NonWeakFunctions
+                        && (sym.st_type() == object::elf::STT_FUNC
+                        && sym.st_bind() != object::elf::STB_WEAK)
+                    )
+                )
+                // Bsymbolic does not affect symbols that are exported
+                && !(self.export_list.is_some() && symbol_is_exported())
+            ));
+
+        let mut flags: ValueFlags = if sym.is_absolute(LittleEndian) {
+            ValueFlags::ABSOLUTE
+        } else if sym.st_type() == object::elf::STT_GNU_IFUNC {
+            ValueFlags::IFUNC
+        } else if is_undefined {
+            if non_interposable {
+                ValueFlags::ABSOLUTE
+            } else {
+                // If we can't bypass the GOT, then an undefined symbol might be able to be defined at
+                // runtime by a dynamic library that gets loaded.
+                ValueFlags::DYNAMIC | ValueFlags::ABSOLUTE
+            }
+        } else {
+            ValueFlags::ADDRESS
+        };
+
+        if non_interposable {
+            flags |= ValueFlags::NON_INTERPOSABLE;
+        }
+        flags
     }
 
     fn should_downgrade_to_local(&self, name: &PreHashed<UnversionedSymbolName>) -> bool {
@@ -1338,27 +1451,32 @@ impl std::fmt::Display for SymbolDebug<'_, '_> {
         }
         if symbol_name.bytes().is_empty() {
             match file {
-                ParsedInput::Prelude(_) => write!(f, "<unnamed internal symbol>")?,
-                ParsedInput::Object(o) => {
+                SequencedInput::Prelude(_) => write!(f, "<unnamed internal symbol>")?,
+                SequencedInput::Object(o) => {
                     let symbol_index = symbol_id.to_input(file.symbol_id_range());
                     if let Some(section_name) = o
+                        .parsed
                         .object
                         .symbol(symbol_index)
                         .ok()
                         .and_then(|symbol| {
-                            o.object.symbol_section(symbol, symbol_index).ok().flatten()
+                            o.parsed
+                                .object
+                                .symbol_section(symbol, symbol_index)
+                                .ok()
+                                .flatten()
                         })
-                        .map(|section_index| o.object.section_display_name(section_index))
+                        .map(|section_index| o.parsed.object.section_display_name(section_index))
                     {
                         write!(f, "section `{section_name}`")?;
                     } else {
                         write!(f, "<unnamed symbol>")?;
                     }
                 }
-                ParsedInput::LinkerScript(s) => {
-                    write!(f, "Symbol from linker script `{}`", s.input)?;
+                SequencedInput::LinkerScript(s) => {
+                    write!(f, "Symbol from linker script `{}`", s.parsed.input)?;
                 }
-                ParsedInput::Epilogue(_) => write!(f, "<unnamed custom-section symbol>")?,
+                SequencedInput::Epilogue(_) => write!(f, "<unnamed custom-section symbol>")?,
             }
         } else {
             write!(f, "symbol `{}`", self.db.symbol_name_for_display(symbol_id))?;
@@ -1412,6 +1530,20 @@ impl SymbolId {
     pub(crate) fn next(self) -> Self {
         Self(self.0 + 1)
     }
+
+    fn as_atomic(self) -> AtomicSymbolId {
+        AtomicSymbolId(AtomicU32::new(self.0))
+    }
+}
+
+impl AtomicSymbolId {
+    fn store(&self, selected: SymbolId) {
+        self.0.store(selected.0, Ordering::Relaxed);
+    }
+
+    fn into_non_atomic(self) -> SymbolId {
+        SymbolId(self.0.into_inner())
+    }
 }
 
 impl TryFrom<usize> for SymbolId {
@@ -1422,29 +1554,24 @@ impl TryFrom<usize> for SymbolId {
     }
 }
 
-impl Prelude<'_> {
+impl<'data> Prelude<'data> {
     fn load_symbols(
         &self,
         symbols_out: &mut SymbolInfoWriter,
-        outputs: &mut SymbolLoadOutputs,
-        output_kind: OutputKind,
+        outputs: &mut SymbolLoadOutputs<'data>,
     ) {
         for definition in &self.symbol_definitions {
             let symbol_id = symbols_out.next;
-            let value_flags = match definition {
-                InternalSymDefInfo::Undefined | InternalSymDefInfo::ForceUndefined(_) => {
+            let value_flags = match definition.placement {
+                SymbolPlacement::Undefined | SymbolPlacement::ForceUndefined => {
                     ValueFlags::ABSOLUTE
                 }
-                InternalSymDefInfo::SectionStart(section_id) => {
-                    let def = section_id.built_in_details();
-                    let name = def.start_symbol_name(output_kind).unwrap().as_bytes();
-                    outputs.add_non_versioned(PendingSymbol::new(symbol_id, name));
+                SymbolPlacement::SectionStart(_) => {
+                    outputs.add_non_versioned(PendingSymbol::new(symbol_id, definition.name));
                     ValueFlags::ADDRESS | ValueFlags::NON_INTERPOSABLE
                 }
-                InternalSymDefInfo::SectionEnd(section_id) => {
-                    let def = section_id.built_in_details();
-                    let name = def.end_symbol_name(output_kind).unwrap().as_bytes();
-                    outputs.add_non_versioned(PendingSymbol::new(symbol_id, name));
+                SymbolPlacement::SectionEnd(_) => {
+                    outputs.add_non_versioned(PendingSymbol::new(symbol_id, definition.name));
                     ValueFlags::ADDRESS | ValueFlags::NON_INTERPOSABLE
                 }
             };
@@ -1459,12 +1586,12 @@ impl std::fmt::Display for SymbolId {
     }
 }
 
-impl InternalSymDefInfo {
+impl InternalSymDefInfo<'_> {
     pub(crate) fn section_id(self) -> Option<OutputSectionId> {
-        match self {
-            InternalSymDefInfo::Undefined | InternalSymDefInfo::ForceUndefined(_) => None,
-            InternalSymDefInfo::SectionStart(i) => Some(i),
-            InternalSymDefInfo::SectionEnd(i) => Some(i),
+        match self.placement {
+            SymbolPlacement::Undefined | SymbolPlacement::ForceUndefined => None,
+            SymbolPlacement::SectionStart(i) => Some(i),
+            SymbolPlacement::SectionEnd(i) => Some(i),
         }
     }
 }
@@ -1497,7 +1624,7 @@ impl<'data> PendingVersionedSymbol<'data> {
 
 /// Decides how many buckets we should use for symbol names.
 fn num_symbol_hash_buckets(args: &Args) -> usize {
-    args.num_threads.get()
+    args.available_threads.get()
 }
 
 impl<'data> SymbolLoadOutputs<'data> {
@@ -1515,6 +1642,68 @@ impl<'data> SymbolLoadOutputs<'data> {
         self.pending_symbols_by_bucket[pending.name.hash() as usize % num_buckets]
             .versioned_symbols
             .push(pending);
+    }
+}
+
+impl<'data, 'db> AtomicSymbolDb<'data, 'db> {
+    fn input_symbol_visibility(&self, symbol_id: SymbolId) -> Visibility {
+        self.db.input_symbol_visibility(symbol_id)
+    }
+
+    fn update_definition(&self, to_update: SymbolId, new_definition: SymbolId) {
+        self.definitions[to_update.as_usize()].store(new_definition);
+    }
+
+    /// Update value flags for `symbol_id` given that we've now changed its visibility to something
+    /// other than default.
+    fn handle_non_default_visibility(&self, symbol_id: SymbolId) {
+        // TODO: Currently we only make the symbol non-interposable, but we should also actually
+        // change its visibility too. We need somewhere to store this information. We also need
+        // linker-diff to report when we get exported dynamic symbols wrong.
+        let flags = &self.symbol_value_flags[symbol_id.as_usize()];
+        if !flags.get().contains(ValueFlags::DYNAMIC) {
+            flags.or_assign(ValueFlags::NON_INTERPOSABLE);
+        }
+    }
+
+    fn local_symbol_value_flags(&self, symbol_id: SymbolId) -> ValueFlags {
+        self.symbol_value_flags[symbol_id.as_usize()].get()
+    }
+
+    fn symbol_strength(&self, symbol_id: SymbolId, resolved: &[ResolvedGroup]) -> SymbolStrength {
+        self.db.symbol_strength(symbol_id, resolved)
+    }
+
+    fn is_in_comdat_group(&self, symbol_id: SymbolId, resolved: &[ResolvedGroup]) -> bool {
+        self.db.is_in_comdat_group(symbol_id, resolved)
+    }
+
+    fn symbol_name_for_display(&self, symbol_id: SymbolId) -> SymbolNameDisplay<'data> {
+        self.db.symbol_name_for_display(symbol_id)
+    }
+
+    fn file<'a>(&'a self, file_id: FileId) -> SequencedInput<'a> {
+        self.db.file(file_id)
+    }
+
+    fn file_id_for_symbol(&self, symbol_id: SymbolId) -> FileId {
+        self.db.file_id_for_symbol(symbol_id)
+    }
+}
+
+impl Drop for AtomicSymbolDb<'_, '_> {
+    fn drop(&mut self) {
+        // Convert our atomic tables back to non-atomic tables and return them to the symbol-db that
+        // we took them from. This operation should be basically free, at least in optimised builds.
+        self.db.symbol_definitions = take(&mut self.definitions)
+            .into_iter()
+            .map(|id| id.into_non_atomic())
+            .collect();
+
+        self.db.symbol_value_flags = take(&mut self.symbol_value_flags)
+            .into_iter()
+            .map(|f| f.into_non_atomic())
+            .collect();
     }
 }
 

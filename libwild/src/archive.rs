@@ -2,9 +2,9 @@
 //! Read trait and we want to borrow the data of each entry. We do however use the ar crate as a dev
 //! dependency in our tests so that we can verify consistency.
 
+use crate::bail;
+use crate::error::Context as _;
 use crate::error::Result;
-use anyhow::Context;
-use anyhow::bail;
 use bytemuck::Pod;
 use bytemuck::Zeroable;
 use std::ffi::OsStr;
@@ -217,17 +217,17 @@ fn evaluate_identifier<'data>(
     ident: &'data str,
     extended_filenames: Option<ExtendedFilenames<'data>>,
 ) -> Identifier<'data> {
-    if let Some(filenames) = extended_filenames {
-        if let Some(rest) = ident.strip_prefix('/') {
-            // GNU ar puts a trailing '/' as the last byte of the identifier, but only if
-            // the filename (excl. leading path components) is exactly 15 bytes long - e.g.
-            // /path/to/src_utils.cpp.o => '/48            /'
-            // /dir/of/src_utils.o      => '/48             '
-            if let Ok(offset) = rest.trim_end_matches('/').trim().parse() {
-                return Identifier {
-                    data: &filenames.data[offset..],
-                };
-            }
+    if let Some(filenames) = extended_filenames
+        && let Some(rest) = ident.strip_prefix('/')
+    {
+        // GNU ar puts a trailing '/' as the last byte of the identifier, but only if
+        // the filename (excl. leading path components) is exactly 15 bytes long - e.g.
+        // /path/to/src_utils.cpp.o => '/48            /'
+        // /dir/of/src_utils.o      => '/48             '
+        if let Ok(offset) = rest.trim_end_matches('/').trim().parse() {
+            return Identifier {
+                data: &filenames.data[offset..],
+            };
         }
     }
     Identifier {
@@ -287,9 +287,8 @@ impl<'data> Iterator for ArchiveIterator<'data> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bail;
     use crate::error::Result;
-    use anyhow::Context;
-    use anyhow::bail;
     use std::io::Read;
     use std::path::Path;
 

@@ -3,6 +3,7 @@ use object::LittleEndian;
 use object::read::elf::ProgramHeader as _;
 use object::read::elf::SectionHeader;
 use std::borrow::Cow;
+use std::fmt;
 
 macro_rules! const_name_by_value {
     ($needle: expr, $( $const:ident ),*) => {
@@ -209,6 +210,105 @@ pub fn aarch64_rel_type_to_string(r_type: u32) -> Cow<'static, str> {
     }
 }
 
+#[must_use]
+pub fn riscv64_rel_type_to_string(r_type: u32) -> Cow<'static, str> {
+    if let Some(name) = const_name_by_value![
+        r_type,
+        R_RISCV_NONE,
+        R_RISCV_32,
+        R_RISCV_64,
+        R_RISCV_RELATIVE,
+        R_RISCV_COPY,
+        R_RISCV_JUMP_SLOT,
+        R_RISCV_TLS_DTPMOD32,
+        R_RISCV_TLS_DTPMOD64,
+        R_RISCV_TLS_DTPREL32,
+        R_RISCV_TLS_DTPREL64,
+        R_RISCV_TLS_TPREL32,
+        R_RISCV_TLS_TPREL64,
+        R_RISCV_TLSDESC,
+        R_RISCV_BRANCH,
+        R_RISCV_JAL,
+        R_RISCV_CALL,
+        R_RISCV_CALL_PLT,
+        R_RISCV_GOT_HI20,
+        R_RISCV_TLS_GOT_HI20,
+        R_RISCV_TLS_GD_HI20,
+        R_RISCV_PCREL_HI20,
+        R_RISCV_PCREL_LO12_I,
+        R_RISCV_PCREL_LO12_S,
+        R_RISCV_HI20,
+        R_RISCV_LO12_I,
+        R_RISCV_LO12_S,
+        R_RISCV_TPREL_HI20,
+        R_RISCV_TPREL_LO12_I,
+        R_RISCV_TPREL_LO12_S,
+        R_RISCV_TPREL_ADD,
+        R_RISCV_ADD8,
+        R_RISCV_ADD16,
+        R_RISCV_ADD32,
+        R_RISCV_ADD64,
+        R_RISCV_SUB8,
+        R_RISCV_SUB16,
+        R_RISCV_SUB32,
+        R_RISCV_SUB64,
+        R_RISCV_GOT32_PCREL,
+        R_RISCV_ALIGN,
+        R_RISCV_RVC_BRANCH,
+        R_RISCV_RVC_JUMP,
+        R_RISCV_RVC_LUI,
+        R_RISCV_GPREL_I,
+        R_RISCV_GPREL_S,
+        R_RISCV_TPREL_I,
+        R_RISCV_TPREL_S,
+        R_RISCV_RELAX,
+        R_RISCV_SUB6,
+        R_RISCV_SET6,
+        R_RISCV_SET8,
+        R_RISCV_SET16,
+        R_RISCV_SET32,
+        R_RISCV_32_PCREL,
+        R_RISCV_IRELATIVE,
+        R_RISCV_PLT32,
+        R_RISCV_SET_ULEB128,
+        R_RISCV_SUB_ULEB128,
+        R_RISCV_TLSDESC_HI20,
+        R_RISCV_TLSDESC_LOAD_LO12,
+        R_RISCV_TLSDESC_ADD_LO12,
+        R_RISCV_TLSDESC_CALL
+    ] {
+        Cow::Borrowed(name)
+    } else {
+        Cow::Owned(format!("Unknown riscv64 relocation type 0x{r_type:x}"))
+    }
+}
+
+#[must_use]
+pub fn segment_type_to_string(p_type: u32) -> Cow<'static, str> {
+    if let Some(name) = const_name_by_value![
+        p_type,
+        PT_NULL,
+        PT_LOAD,
+        PT_DYNAMIC,
+        PT_INTERP,
+        PT_NOTE,
+        PT_SHLIB,
+        PT_PHDR,
+        PT_TLS,
+        PT_GNU_EH_FRAME,
+        PT_GNU_STACK,
+        PT_GNU_RELRO,
+        PT_GNU_PROPERTY,
+        PT_GNU_SFRAME,
+        // RISC-V specific program headers
+        SHT_RISCV_ATTRIBUTES
+    ] {
+        Cow::Borrowed(name)
+    } else {
+        Cow::Owned(format!("UNKNOWN_P_TYPE_{p_type}"))
+    }
+}
+
 /// Section flag bit values.
 pub mod shf {
     use super::SectionFlags;
@@ -249,6 +349,7 @@ pub mod sht {
     pub const GROUP: SectionType = SectionType(object::elf::SHT_GROUP);
     pub const SYMTAB_SHNDX: SectionType = SectionType(object::elf::SHT_SYMTAB_SHNDX);
     pub const LOOS: SectionType = SectionType(object::elf::SHT_LOOS);
+    pub const GNU_SFRAME: SectionType = SectionType(object::elf::SHT_GNU_SFRAME);
     pub const GNU_ATTRIBUTES: SectionType = SectionType(object::elf::SHT_GNU_ATTRIBUTES);
     pub const GNU_HASH: SectionType = SectionType(object::elf::SHT_GNU_HASH);
     pub const GNU_LIBLIST: SectionType = SectionType(object::elf::SHT_GNU_LIBLIST);
@@ -265,6 +366,7 @@ pub mod sht {
     pub const HIPROC: SectionType = SectionType(object::elf::SHT_HIPROC);
     pub const LOUSER: SectionType = SectionType(object::elf::SHT_LOUSER);
     pub const HIUSER: SectionType = SectionType(object::elf::SHT_HIUSER);
+    pub const RISCV_ATTRIBUTES: SectionType = SectionType(object::elf::SHT_RISCV_ATTRIBUTES);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -322,38 +424,24 @@ impl From<u64> for SectionFlags {
 
 impl std::fmt::Display for SectionFlags {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.contains(shf::WRITE) {
-            f.write_str("W")?;
-        }
-        if self.contains(shf::ALLOC) {
-            f.write_str("A")?;
-        }
-        if self.contains(shf::EXECINSTR) {
-            f.write_str("X")?;
-        }
-        if self.contains(shf::MERGE) {
-            f.write_str("M")?;
-        }
-        if self.contains(shf::STRINGS) {
-            f.write_str("S")?;
-        }
-        if self.contains(shf::INFO_LINK) {
-            f.write_str("I")?;
-        }
-        if self.contains(shf::LINK_ORDER) {
-            f.write_str("L")?;
-        }
-        if self.contains(shf::OS_NONCONFORMING) {
-            f.write_str("O")?;
-        }
-        if self.contains(shf::GROUP) {
-            f.write_str("G")?;
-        }
-        if self.contains(shf::TLS) {
-            f.write_str("T")?;
-        }
-        if self.contains(shf::COMPRESSED) {
-            f.write_str("C")?;
+        for (flag, ch) in [
+            (shf::WRITE, "W"),
+            (shf::ALLOC, "A"),
+            (shf::EXECINSTR, "X"),
+            (shf::MERGE, "M"),
+            (shf::STRINGS, "S"),
+            (shf::INFO_LINK, "I"),
+            (shf::LINK_ORDER, "L"),
+            (shf::OS_NONCONFORMING, "O"),
+            (shf::GROUP, "G"),
+            (shf::TLS, "T"),
+            (shf::COMPRESSED, "C"),
+            // TODO: ld linker sometimes propagates the flag
+            // (shf::GNU_RETAIN, "R"),
+        ] {
+            if self.contains(flag) {
+                f.write_str(ch)?;
+            }
         }
         Ok(())
     }
@@ -488,6 +576,10 @@ pub mod secnames {
     pub const GROUP_SECTION_NAME: &[u8] = GROUP_SECTION_NAME_STR.as_bytes();
     pub const DATA_REL_RO_SECTION_NAME_STR: &str = ".data.rel.ro";
     pub const DATA_REL_RO_SECTION_NAME: &[u8] = DATA_REL_RO_SECTION_NAME_STR.as_bytes();
+    pub const RISCV_ATTRIBUTES_SECTION_NAME_STR: &str = ".riscv.attributes";
+    pub const RISCV_ATTRIBUTES_SECTION_NAME: &[u8] = RISCV_ATTRIBUTES_SECTION_NAME_STR.as_bytes();
+
+    pub const GNU_LTO_SYMTAB_PREFIX: &str = ".gnu.lto_.symtab";
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -627,6 +719,35 @@ impl std::ops::BitAnd for SegmentFlags {
     }
 }
 
+// RISC-V related constants
+
+/// Dynamic thread vector pointers point 0x800 past the start of each TLS block.
+pub const RISCV_TLS_DTV_OFFSET: u64 = 0x800;
+
+pub const RISCV_ATTRIBUTE_VENDOR_NAME: &str = "riscv";
+
+// RISC-V ELF Tag constants, see: https://github.com/riscv-non-isa/riscv-elf-psabi-doc/blob/master/riscv-elf.adoc#risc-v-specific-dynamic-section-tags
+pub mod riscvattr {
+    // Attributes relate to whole file.
+    pub const TAG_RISCV_WHOLE_FILE: u64 = 1;
+    // Indicates the stack alignment requirement in bytes (ULEB128).
+    pub const TAG_RISCV_STACK_ALIGN: u64 = 4;
+    // Indicates the target architecture of this object (NTBS).
+    pub const TAG_RISCV_ARCH: u64 = 5;
+    // Indicates whether to impose unaligned memory accesses in code generation (ULEB128).
+    pub const TAG_RISCV_UNALIGNED_ACCESS: u64 = 6;
+    // Indicates the major version of the privileged specification (ULEB128, deprecated).
+    pub const TAG_RISCV_PRIV_SPEC: u64 = 8;
+    // Indicates the minor version of the privileged specification (ULEB128, deprecated).
+    pub const TAG_RISCV_PRIV_SPEC_MINOR: u64 = 10;
+    // Indicates the revision version of the privileged specification (ULEB128, deprecated).
+    pub const TAG_RISCV_PRIV_SPEC_REVISION: u64 = 12;
+    // Indicates which version of the atomics ABI is being used (ULEB128).
+    pub const TAG_RISCV_ATOMIC_ABI: u64 = 14;
+    // Indicates the usage definition of the X3 register (ULEB128).
+    pub const TAG_RISCV_X3_REG_USAGE: u64 = 16;
+}
+
 /// For additional information on ELF relocation types, see "ELF-64 Object File Format" -
 /// https://uclibc.org/docs/elf-64-gen.pdf. For information on the TLS related relocations, see "ELF
 /// Handling For Thread-Local Storage" - https://www.uclibc.org/docs/tls.pdf.
@@ -635,12 +756,38 @@ pub enum RelocationKind {
     /// The absolute address of a symbol or section.
     Absolute,
 
+    /// The absolute address of a symbol or section related to EH section.
+    AbsoluteSet,
+
+    /// The 6 low bits of an absolute address of a symbol or section.
+    AbsoluteSetWord6,
+
+    /// Add the absolute address of a symbol or section at the place of the relocation
+    /// to the value at the place.
+    AbsoluteAddition,
+
+    /// Subtract the absolute address of a symbol or section at the place of the relocation
+    /// from the value at the place.
+    AbsoluteSubtraction,
+
+    /// Subtract the absolute address of a symbol or section at the place of the relocation
+    /// from the value at the place (use WORD6 type for the operation)
+    AbsoluteSubtractionWord6,
+
     /// The absolute address of a symbol or section. We are going to extract only the offset
     /// within a page, so dynamic relocation creation must be skipped.
     AbsoluteAArch64,
 
+    /// Subtract addresses of two symbols and encode the value using ULEB128.
+    PairSubtraction,
+
     /// The address of the symbol, relative to the place of the relocation.
     Relative,
+
+    /// The address of the symbol, relative to the place of the relocation. The address of the relocation
+    /// points to an instruction for which the R_RISCV_PCREL_HI20 relocation is used and that is the place
+    /// we make this relocation relative to.
+    RelativeRiscVLow12,
 
     /// The address of the symbol, relative to the base address of the GOT.
     SymRelGotBase,
@@ -701,9 +848,6 @@ pub enum RelocationKind {
     /// The offset of a TLS variable within the executable's TLS storage.
     TpOff,
 
-    /// The offset of a TLS variable within the executable's TLS storage, AArch64 TLS block layout.
-    TpOffAArch64,
-
     /// The address of a TLS descriptor structure, relative to the place of the relocation.
     TlsDesc,
 
@@ -719,6 +863,9 @@ pub enum RelocationKind {
     /// No relocation needs to be applied. Produced when we eliminate a relocation due to an
     /// optimisation.
     None,
+
+    /// The address must fulfill the alignment requirement.
+    Alignment,
 }
 
 impl RelocationKind {
@@ -739,7 +886,7 @@ impl RelocationKind {
                 | Self::TlsLd
                 | Self::TlsLdGot
                 | Self::TlsLdGotBase
-                | Self::TpOffAArch64
+                | Self::TpOff
         )
     }
 }
@@ -828,6 +975,22 @@ impl DynamicRelocationKind {
             DynamicRelocationKind::JumpSlot => object::elf::R_AARCH64_JUMP_SLOT,
         }
     }
+
+    #[must_use]
+    pub fn riscv64_r_type(&self) -> u32 {
+        match self {
+            DynamicRelocationKind::Copy => object::elf::R_RISCV_COPY,
+            DynamicRelocationKind::Irelative => object::elf::R_RISCV_IRELATIVE,
+            DynamicRelocationKind::DtpMod => object::elf::R_RISCV_TLS_DTPMOD64,
+            DynamicRelocationKind::DtpOff => object::elf::R_RISCV_TLS_DTPREL64,
+            DynamicRelocationKind::TpOff => object::elf::R_RISCV_TLS_TPREL64,
+            DynamicRelocationKind::Relative => object::elf::R_RISCV_RELATIVE,
+            DynamicRelocationKind::Absolute => object::elf::R_RISCV_64,
+            DynamicRelocationKind::GotEntry => object::elf::R_RISCV_64,
+            DynamicRelocationKind::TlsDesc => object::elf::R_RISCV_TLSDESC,
+            DynamicRelocationKind::JumpSlot => object::elf::R_RISCV_JUMP_SLOT,
+        }
+    }
 }
 
 // Half-opened range bounded inclusively below and exclusively above: [`start`, `end`)
@@ -838,7 +1001,7 @@ pub struct BitRange {
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
-pub enum RelocationInstruction {
+pub enum AArch64Instruction {
     Adr,
     Movkz,
     Movnz,
@@ -849,6 +1012,51 @@ pub enum RelocationInstruction {
     TstBr,
     Bcond,
     JumpCall,
+}
+
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+pub enum RiscVInstruction {
+    // The relocation encoding actually modifies the consecutive pair of instructions:
+    //   10:	00000097          	auipc	ra,0x0	10: R_RISCV_CALL_PLT	symbol_name
+    //   14:	000080e7          	jalr	ra # 10 <main+0x10>
+    //
+    // That makes the relocation pretty unusual as one would expect 2 relocations:
+    // https://github.com/riscv-non-isa/riscv-elf-psabi-doc/blob/master/riscv-elf.adoc#procedure-calls
+    UiType,
+
+    // Encodes high 20 bits of 32-bit value and encodes the bits to upper part.
+    UType,
+
+    // Encodes low 12 bits of 32-bit value and encodes the bits to upper part.
+    IType,
+
+    // Encodes 12 bits of 32-bit value.
+    SType,
+
+    // The X-type instruction immediate encoding is defined here:
+    // https://riscv.github.io/riscv-isa-manual/snapshot/unprivileged/#_immediate_encoding_variants
+
+    // Specifies a field as the immediate field in a B-type (branch) instruction
+    BType,
+
+    // Specifies a field as the immediate field in a J-type (jump) instruction
+    JType,
+
+    // Specifies a field as the immediate field in a CB-type (compressed branch) instruction
+    // https://riscv.github.io/riscv-isa-manual/snapshot/unprivileged/#_control_transfer_instructions_2
+    CbType,
+
+    // Specifies a field as the immediate field in a CJ-type (compressed jump) instruction
+    CjType,
+
+    // Encode the value using ULEB128 encoding (the size of the output is variable based on the value)
+    Uleb128,
+}
+
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+pub enum RelocationInstruction {
+    AArch64(AArch64Instruction),
+    RiscV(RiscVInstruction),
 }
 
 impl RelocationInstruction {
@@ -868,6 +1076,32 @@ impl RelocationInstruction {
 
         mask
     }
+
+    pub fn write_to_value(self, extracted_value: u64, negative: bool, dest: &mut [u8]) {
+        match self {
+            Self::AArch64(insn) => insn.write_to_value(extracted_value, negative, dest),
+            Self::RiscV(insn) => insn.write_to_value(extracted_value, negative, dest),
+        }
+    }
+
+    /// The inverse of `write_to_value`. Returns `(extracted_value, negative)`. Supplied `bytes`
+    /// must be at least 4 bytes, otherwise we panic.
+    #[must_use]
+    pub fn read_value(self, bytes: &[u8]) -> (u64, bool) {
+        match self {
+            Self::AArch64(insn) => insn.read_value(bytes),
+            Self::RiscV(insn) => insn.read_value(bytes),
+        }
+    }
+
+    /// The number of bytes the relocation actually can modify in the output data.
+    #[must_use]
+    pub fn write_windows_size(self) -> usize {
+        match self {
+            Self::AArch64(..) => 4,
+            Self::RiscV(..) => 10,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
@@ -876,13 +1110,40 @@ pub enum RelocationSize {
     BitMasking(BitMask),
 }
 
+impl fmt::Display for RelocationSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ByteSize(bytes) => f.write_fmt(format_args!("{bytes}B")),
+            Self::BitMasking(mask) => {
+                f.write_fmt(format_args!("{}..{}", mask.range.start, mask.range.end))
+            }
+        }
+    }
+}
+
 impl RelocationSize {
-    pub(crate) const fn bit_mask(
+    pub(crate) const fn bit_mask_aarch64(
         bit_start: u32,
         bit_end: u32,
-        instruction: RelocationInstruction,
+        instruction: AArch64Instruction,
     ) -> RelocationSize {
-        Self::BitMasking(BitMask::new(instruction, bit_start, bit_end))
+        Self::BitMasking(BitMask::new(
+            RelocationInstruction::AArch64(instruction),
+            bit_start,
+            bit_end,
+        ))
+    }
+
+    pub(crate) const fn bit_mask_riscv(
+        bit_start: u32,
+        bit_end: u32,
+        instruction: RiscVInstruction,
+    ) -> RelocationSize {
+        Self::BitMasking(BitMask::new(
+            RelocationInstruction::RiscV(instruction),
+            bit_start,
+            bit_end,
+        ))
     }
 }
 
@@ -959,9 +1220,18 @@ impl BitMask {
     }
 }
 
+/// Extract a single bit from the provided `value`.
+#[must_use]
+pub fn extract_bit(value: u64, position: u32) -> u64 {
+    extract_bits(value, position, position + 1)
+}
+
 /// Extract range-specified ([`start`..`end`]) bits from the provided `value`.
 #[must_use]
 pub fn extract_bits(value: u64, start: u32, end: u32) -> u64 {
+    if start == 0 && end == u64::BITS {
+        return value;
+    }
     debug_assert!(start < end);
     (value >> (start)) & ((1 << (end - start)) - 1)
 }

@@ -4,149 +4,367 @@
 //! generally passed via the --version-script flag instead. They can also sometimes be quite large.
 //! For this reason, we have a separate parser for them.
 
+use crate::error;
 use crate::error::Result;
 use crate::hash::PassThroughHasher;
 use crate::hash::PreHashed;
-use crate::input_data::VersionScriptData;
+use crate::input_data::ScriptData;
+use crate::linker_script::skip_comments_and_whitespace;
 use crate::symbol::UnversionedSymbolName;
-use anyhow::Context as _;
-use anyhow::anyhow;
-use anyhow::bail;
+use glob::Pattern;
 use std::collections::HashSet;
+use symbolic_demangle::Demangle;
+use symbolic_demangle::DemangleOptions;
+use winnow::BStr;
+use winnow::Parser;
+use winnow::error::ContextError;
+use winnow::error::FromExternalError;
+use winnow::token::take_until;
+use winnow::token::take_while;
+
+#[derive(Debug, Default)]
+pub(crate) struct MatchRules<'data> {
+    pub(crate) general: BasicMatchRules<'data>,
+    pub(crate) cxx: BasicMatchRules<'data>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct VersionBody<'data> {
+    globals: MatchRules<'data>,
+    locals: MatchRules<'data>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct Version<'data> {
+    pub(crate) name: &'data [u8],
+    pub(crate) parent_index: Option<u16>,
+    pub(crate) version_body: VersionBody<'data>,
+}
 
 /// A version script. See https://sourceware.org/binutils/docs/ld/VERSION.html
 #[derive(Default)]
 pub(crate) struct VersionScript<'data> {
-    /// For symbol visibility we only need to know whether the symbol is global or local.
-    globals: MatchRules<'data>,
-    locals: MatchRules<'data>,
     versions: Vec<Version<'data>>,
 }
 
-pub(crate) struct Version<'data> {
-    pub(crate) name: &'data str,
-    pub(crate) parent_index: Option<u16>,
-    symbols: MatchRules<'data>,
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) enum SymbolMatcher<'data> {
+    // Exact match.
+    Exact(&'data [u8]),
+    // A glob pattern with a '*' token.
+    StarGlob(Pattern),
+    // A glob pattern without any '*' token.
+    NonstarGlob(Pattern),
+    /// Glob pattern equal to '*'
+    MatchesAll,
 }
 
-#[derive(Default)]
-struct MatchRules<'data> {
-    matches_all: bool,
+#[derive(Debug, Default)]
+pub(crate) struct BasicMatchRules<'data> {
     exact: HashSet<PreHashed<UnversionedSymbolName<'data>>, PassThroughHasher>,
-    prefixes: Vec<&'data [u8]>,
+    star_globs: Vec<Pattern>,
+    nonstar_globs: Vec<Pattern>,
+    matches_all: bool,
 }
 
-impl<'data> MatchRules<'data> {
+impl<'data> BasicMatchRules<'data> {
     fn push(&mut self, pattern: SymbolMatcher<'data>) {
         match pattern {
-            SymbolMatcher::All => self.matches_all = true,
-            SymbolMatcher::Prefix(prefix) => self.prefixes.push(prefix.as_bytes()),
+            SymbolMatcher::MatchesAll => self.matches_all = true,
+            SymbolMatcher::StarGlob(glob) => self.star_globs.push(glob),
+            SymbolMatcher::NonstarGlob(glob) => self.nonstar_globs.push(glob),
             SymbolMatcher::Exact(exact) => {
-                self.exact
-                    .insert(UnversionedSymbolName::prehashed(exact.as_bytes()));
+                self.exact.insert(UnversionedSymbolName::prehashed(exact));
             }
         }
     }
 
-    fn matches(&self, name: &PreHashed<UnversionedSymbolName>) -> bool {
+    #[inline]
+    pub(crate) fn matches_exact(
+        &self,
+        lookup: &mut SymbolLookupNameWrapper,
+        mangled: bool,
+    ) -> bool {
+        // Early exit before we actually demangle the name.
+        if self.exact.is_empty() {
+            return false;
+        }
+
+        if mangled {
+            let demangled_name = lookup.get_demangled_name();
+            // The creation of UnversionedSymbolName should be relatively cheap as we construct
+            // it at most twice.
+            self.exact
+                .contains(&UnversionedSymbolName::prehashed(demangled_name.as_bytes()))
+        } else {
+            self.exact.contains(lookup.name)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn matches_glob(
+        &self,
+        lookup: &mut SymbolLookupNameWrapper,
+        non_star: bool,
+        mangled: bool,
+    ) -> bool {
+        let mut globs = if non_star {
+            self.nonstar_globs.iter().peekable()
+        } else {
+            self.star_globs.iter().peekable()
+        };
+        // Early exit before we actually demangle the name.
+        if globs.peek().is_none() {
+            return false;
+        }
+
+        let name = if mangled {
+            lookup.get_demangled_name()
+        } else {
+            lookup.get_name_string()
+        };
+
+        globs.any(|pattern| pattern.matches(name))
+    }
+
+    #[inline]
+    pub(crate) fn matches_all(&self) -> bool {
         self.matches_all
-            || self.exact.contains(name)
-            || self
-                .prefixes
-                .iter()
-                .any(|prefix| name.bytes().starts_with(prefix))
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum SymbolMatcher<'data> {
-    All,
-    Prefix(&'data str),
-    Exact(&'data str),
+enum VersionRuleSection {
+    Global,
+    Local,
+}
+
+#[derive(Debug)]
+pub(crate) enum ParsedSymbolMatcher<'data> {
+    Single(SymbolMatcher<'data>),
+    Multiple(Vec<SymbolMatcher<'data>>),
+    CxxMatchers(Vec<SymbolMatcher<'data>>),
+}
+
+impl<'data> MatchRules<'data> {
+    pub(crate) fn push(&mut self, pattern: ParsedSymbolMatcher<'data>) {
+        match pattern {
+            ParsedSymbolMatcher::Single(single) => {
+                self.general.push(single);
+            }
+            ParsedSymbolMatcher::Multiple(matchers) => {
+                for matcher in matchers {
+                    self.general.push(matcher);
+                }
+            }
+            ParsedSymbolMatcher::CxxMatchers(matchers) => {
+                for matcher in matchers {
+                    self.cxx.push(matcher);
+                }
+            }
+        }
+    }
+}
+
+pub(crate) struct SymbolLookupNameWrapper<'data> {
+    name: &'data PreHashed<UnversionedSymbolName<'data>>,
+    name_string: Option<&'data str>,
+    demangled_name: Option<String>,
+}
+
+impl<'data> SymbolLookupNameWrapper<'data> {
+    pub(crate) fn from_name(name: &'data PreHashed<UnversionedSymbolName<'data>>) -> Self {
+        Self {
+            name,
+            name_string: None,
+            demangled_name: None,
+        }
+    }
+
+    pub(crate) fn get_name_string(&mut self) -> &'data str {
+        self.name_string.get_or_insert_with(|| {
+            str::from_utf8(self.name.bytes()).unwrap_or_else(|_| {
+                panic!(
+                    "Valid utf-8 identifier expected: {}",
+                    String::from_utf8_lossy(self.name.bytes())
+                )
+            })
+        })
+    }
+
+    pub(crate) fn get_demangled_name(&mut self) -> &String {
+        // Extract the name string before the closure to avoid double mutable borrow
+        let name_string = self.get_name_string();
+        self.demangled_name.get_or_insert_with(|| {
+            symbolic_common::Name::new(
+                name_string,
+                symbolic_common::NameMangling::Mangled,
+                symbolic_common::Language::Cpp,
+            )
+            .demangle(DemangleOptions::complete().return_type(false))
+            // Consider the original name if the demangler returns None.
+            .unwrap_or_else(|| name_string.to_string())
+        })
+    }
+}
+
+impl<'data> VersionScript<'data> {
+    fn find_match(
+        &self,
+        name: &PreHashed<UnversionedSymbolName>,
+    ) -> Option<(usize, VersionRuleSection)> {
+        // Perform symbol lookup the same was as descried for the LLD (and partially Mold) linker:
+        // https://maskray.me/blog/2020-11-26-all-about-symbol-versioning#version-script
+        let mut lookup_name = SymbolLookupNameWrapper::from_name(name);
+
+        // 1) The first version tag with an exact pattern wins.
+        for (i, version) in self.versions.iter().enumerate() {
+            let body = &version.version_body;
+
+            if body.globals.general.matches_exact(&mut lookup_name, false) {
+                return Some((i, VersionRuleSection::Global));
+            } else if body.locals.general.matches_exact(&mut lookup_name, false) {
+                return Some((i, VersionRuleSection::Local));
+            // Intentionally try first non-mangled names as it's much cheaper test.
+            } else if body.globals.cxx.matches_exact(&mut lookup_name, true) {
+                return Some((i, VersionRuleSection::Global));
+            } else if body.locals.cxx.matches_exact(&mut lookup_name, true) {
+                return Some((i, VersionRuleSection::Local));
+            }
+        }
+
+        // 2) Otherwise, the last version tag with a non-* wildcard pattern wins ('global' should be checked first).
+        //    Otherwise, the last version tag with a * pattern wins.
+        for &non_star in &[true, false] {
+            for (i, version) in self.versions.iter().enumerate().rev() {
+                let body = &version.version_body;
+                if body
+                    .globals
+                    .general
+                    .matches_glob(&mut lookup_name, non_star, false)
+                    || body
+                        .globals
+                        .cxx
+                        .matches_glob(&mut lookup_name, non_star, true)
+                {
+                    return Some((i, VersionRuleSection::Global));
+                } else if body
+                    .locals
+                    .general
+                    .matches_glob(&mut lookup_name, non_star, false)
+                    || body
+                        .locals
+                        .cxx
+                        .matches_glob(&mut lookup_name, non_star, true)
+                {
+                    return Some((i, VersionRuleSection::Local));
+                }
+            }
+        }
+
+        // 3) Otherwise, the last version tag with match all (*).
+        for (i, version) in self.versions.iter().enumerate().rev() {
+            let body = &version.version_body;
+            if body.globals.general.matches_all || body.globals.cxx.matches_all {
+                return Some((i, VersionRuleSection::Global));
+            } else if body.locals.general.matches_all || body.locals.cxx.matches_all {
+                return Some((i, VersionRuleSection::Local));
+            }
+        }
+
+        None
+    }
+}
+
+fn parse_version_script<'input>(input: &mut &'input BStr) -> winnow::Result<VersionScript<'input>> {
+    // List of version names in the script, used to map parent version to version indexes
+    let mut version_names: Vec<&[u8]> = Vec::new();
+
+    skip_comments_and_whitespace(input)?;
+
+    // Simple version script, only defines symbols visibility
+    if input.starts_with(b"{") {
+        let version_body = parse_version_section(input)?;
+
+        ";".parse_next(input)?;
+
+        skip_comments_and_whitespace(input)?;
+
+        return Ok(VersionScript {
+            versions: vec![Version {
+                version_body,
+                ..Default::default()
+            }],
+        });
+    }
+
+    let mut version_script = VersionScript::default();
+
+    // Base version placeholder
+    version_names.push(b"");
+    version_script.versions.push(Version::default());
+
+    while !input.is_empty() {
+        let name = parse_token(input)?;
+
+        skip_comments_and_whitespace(input)?;
+
+        let version_body = parse_version_section(input)?;
+
+        let parent_name = take_until(0.., b';').parse_next(input)?;
+
+        let parent_index = if parent_name.is_empty() {
+            None
+        } else {
+            // We don't expect lots of versions, so a linear scan seems reasonable.
+            Some(
+                version_names
+                    .iter()
+                    .position(|v| v == &parent_name)
+                    .ok_or_else(|| {
+                        ContextError::from_external_error(
+                            input,
+                            VersionScriptError::UnknownParentVersion,
+                        )
+                    })? as u16,
+            )
+        };
+
+        ";".parse_next(input)?;
+
+        skip_comments_and_whitespace(input)?;
+
+        version_names.push(name);
+        version_script.versions.push(Version {
+            name,
+            parent_index,
+            version_body,
+        });
+    }
+
+    Ok(version_script)
 }
 
 impl<'data> VersionScript<'data> {
     #[tracing::instrument(skip_all, name = "Parse version script")]
-    pub(crate) fn parse(data: VersionScriptData<'data>) -> Result<VersionScript<'data>> {
-        let mut tokens = Tokeniser::new(data.raw);
-        let mut version_script = Self::default();
-
-        // List of version names in the script, used to map parent version to version indexes
-        let mut version_names = Vec::new();
-
-        tokens.text = tokens.text.trim();
-
-        let mut token = tokens.next().ok_or_else(|| anyhow!("No tokens found"))?;
-        // Simple version script, only defines symbols visibility
-        if token.starts_with('{') {
-            parse_version_section(
-                &mut tokens,
-                &mut version_script.locals,
-                &mut version_script.globals,
-                None,
-            )?;
-            return Ok(version_script);
-        }
-
-        // Base version placeholder
-        version_names.push("");
-        version_script.versions.push(Version {
-            name: "",
-            symbols: MatchRules::default(),
-            parent_index: None,
-        });
-
-        loop {
-            tokens.expect("{")?;
-            version_names.push(token);
-
-            let mut version_symbols = MatchRules::default();
-            let parent = parse_version_section(
-                &mut tokens,
-                &mut version_script.locals,
-                &mut version_script.globals,
-                Some(&mut version_symbols),
-            )?;
-            let parent_index = if let Some(parent) = parent {
-                // TODO: For longer version scripts IndexSet makes sense, but is it even realistic use case?
-                Some(
-                    version_names
-                        .iter()
-                        .position(|v| v == &parent)
-                        .with_context(|| format!("Could not find version {parent}"))?
-                        as u16,
-                )
-            } else {
-                None
-            };
-
-            version_script.versions.push(Version {
-                name: token,
-                parent_index,
-                symbols: version_symbols,
-            });
-
-            // Next version for the symbols
-            if let Some(next_token) = tokens.next() {
-                token = next_token;
-            } else {
-                break;
-            };
-        }
-
-        Ok(version_script)
+    pub(crate) fn parse(data: ScriptData<'data>) -> Result<VersionScript<'data>> {
+        parse_version_script
+            .parse(BStr::new(data.raw))
+            .map_err(|err| error!("Failed to parse version script:\n{err}"))
     }
 
     pub(crate) fn is_local(&self, name: &PreHashed<UnversionedSymbolName>) -> bool {
-        if self.globals.matches(name) {
-            return false;
-        }
-        self.locals.matches(name)
+        self.find_match(name)
+            .is_some_and(|(_, rule)| matches!(rule, VersionRuleSection::Local))
     }
 
     /// Number of versions in the Version Script, including the base version.
     pub(crate) fn version_count(&self) -> u16 {
-        self.versions.len() as u16
+        if self.versions.len() == 1 {
+            // Ignore it if we have just the base version.
+            0
+        } else {
+            self.versions.len() as u16
+        }
     }
 
     pub(crate) fn parent_count(&self) -> u16 {
@@ -156,7 +374,7 @@ impl<'data> VersionScript<'data> {
             .count() as u16
     }
 
-    pub(crate) fn version_iter(&self) -> impl Iterator<Item = &Version> {
+    pub(crate) fn version_iter(&self) -> impl Iterator<Item = &Version<'data>> {
         self.versions.iter()
     }
 
@@ -164,185 +382,201 @@ impl<'data> VersionScript<'data> {
         &self,
         name: &PreHashed<UnversionedSymbolName>,
     ) -> Option<u16> {
-        self.versions.iter().enumerate().find_map(|(number, ver)| {
-            ver.is_present(name)
-                .then(|| number as u16 + object::elf::VER_NDX_GLOBAL)
+        self.find_match(name).and_then(|(number, _)| {
+            if number == 0 {
+                // Ignore the implicit version!
+                None
+            } else {
+                Some(number as u16 + object::elf::VER_NDX_GLOBAL)
+            }
         })
     }
 }
 
-enum VersionRuleSection {
-    Global,
-    Local,
-}
-
-/// Parses contents after opening brace up to closing brace, adding symbols to the respective rules.
-/// Returns contents after closing brace if any.
-fn parse_version_section<'data>(
-    tokens: &mut Tokeniser<'data>,
-    locals: &mut MatchRules<'data>,
-    globals: &mut MatchRules<'data>,
-    mut versioned_symbols: Option<&mut MatchRules<'data>>,
-) -> Result<Option<&'data str>> {
+fn parse_version_section<'data>(input: &mut &'data BStr) -> winnow::Result<VersionBody<'data>> {
     let mut section = None;
 
-    // We read line-by-line rather than token-by-token because it's much faster. This is
-    // important when for example rustc emits a version script that's more than 300k lines.
-    while let Some(line) = tokens.next_line() {
-        let mut line = line.trim();
-        if let Some(parent_string) = line.strip_prefix('}') {
-            if parent_string.starts_with(';') {
-                return Ok(None);
-            }
-            return Ok(parent_string.trim().strip_suffix(';'));
-        }
-        // Note, we don't currently support comments that have content after them on the same
-        // line. Doing so would require us to search every line for embedded comments, which
-        // would hurt performance.
-        if line.ends_with("*/") {
-            if let Some(start_index) = line.find("/*") {
-                line = line[..start_index].trim();
-            }
+    let mut out = VersionBody::default();
+
+    '{'.parse_next(input)?;
+
+    loop {
+        skip_comments_and_whitespace(input)?;
+
+        if input.starts_with(b"}") {
+            '}'.parse_next(input)?;
+            skip_comments_and_whitespace(input)?;
+            break;
         }
 
-        if line.starts_with("/*") {
-            while let Some(line) = tokens.next_line() {
-                if line.ends_with("*/") {
-                    break;
-                }
-            }
-        } else if line == "global:" {
+        if input.starts_with(b"global:") {
+            "global:".parse_next(input)?;
             section = Some(VersionRuleSection::Global);
-        } else if line == "local:" {
+        } else if input.starts_with(b"local:") {
+            "local:".parse_next(input)?;
             section = Some(VersionRuleSection::Local);
-        } else if let Some(pattern) = line.strip_suffix(';') {
+        } else {
+            let matcher = parse_matcher(input, false)?;
+
             match section {
                 Some(VersionRuleSection::Global) | None => {
-                    globals.push(SymbolMatcher::from_pattern(pattern)?);
+                    out.globals.push(matcher);
                 }
                 Some(VersionRuleSection::Local) => {
-                    locals.push(SymbolMatcher::from_pattern(pattern)?);
+                    out.locals.push(matcher);
                 }
             }
-            if let Some(versioned_symbols) = versioned_symbols.as_deref_mut() {
-                versioned_symbols.push(SymbolMatcher::from_pattern(pattern)?);
-            }
-        } else if !line.is_empty() {
-            bail!("Unsupported version script line `{line}`");
         }
     }
-    bail!("Missing close '}}' in version script");
+
+    Ok(out)
 }
 
-impl Version<'_> {
-    fn is_present(&self, name: &PreHashed<UnversionedSymbolName>) -> bool {
-        self.symbols.matches(name)
-    }
-}
+pub(crate) fn parse_matcher<'data>(
+    input: &mut &'data BStr,
+    without_semicolon: bool, // e.g. symbol to export passed via CLI arg
+) -> winnow::Result<ParsedSymbolMatcher<'data>> {
+    if input.starts_with(b"extern ") {
+        let mut matchers = Vec::new();
+        b"extern ".parse_next(input)?;
+        let cxx = if input.starts_with(b"\"C++\"") {
+            b"\"C++\"".parse_next(input)?;
+            true
+        } else if input.starts_with(b"\"C\"") {
+            b"\"C\"".parse_next(input)?;
+            false
+        } else {
+            let unsupported_extern: String = "{".parse_to().parse_next(input)?;
+            return Err(ContextError::from_external_error(
+                input,
+                VersionScriptError::UnsupportedExtern(unsupported_extern),
+            ));
+        };
+        skip_comments_and_whitespace(input)?;
+        '{'.parse_next(input)?;
 
-impl<'data> SymbolMatcher<'data> {
-    fn from_pattern(token: &'data str) -> Result<SymbolMatcher<'data>> {
-        if token == "*" {
-            return Ok(SymbolMatcher::All);
-        }
-        if let Some(prefix) = token.strip_suffix('*') {
-            if prefix.contains('*') {
-                bail!("Unsupported symbol pattern '{token}'");
-            }
-            return Ok(SymbolMatcher::Prefix(prefix));
-        }
-        if token.contains('*') {
-            bail!("Unsupported symbol pattern '{token}'");
-        }
-        Ok(SymbolMatcher::Exact(token))
-    }
-}
-
-struct Tokeniser<'a> {
-    text: &'a str,
-}
-
-impl<'a> Tokeniser<'a> {
-    fn next(&mut self) -> Option<&'a str> {
         loop {
-            self.text = self.text.trim_start();
-            if try_take(&mut self.text, "/*") {
-                if take_up_to(&mut self.text, "*/").is_err() {
-                    self.text = "";
+            skip_comments_and_whitespace(input)?;
+
+            if input.starts_with(b"};") {
+                b"};".parse_next(input)?;
+                skip_comments_and_whitespace(input)?;
+                break;
+            }
+
+            // Symbols at the end of `extern` blocks may omit semicolons
+            let expect_semicolon = {
+                let remaining = &**input;
+                if let Some(close_pos) = remaining.windows(2).position(|w| w == b"};") {
+                    remaining[..close_pos].contains(&b';')
+                } else {
+                    without_semicolon
                 }
-                continue;
-            }
-            if self.text.starts_with('#') {
-                if take_up_to(&mut self.text, "\n").is_err() {
-                    self.text = "";
-                }
-                continue;
-            }
-            if self.text.is_empty() {
-                return None;
-            }
-            let bytes = self.text.as_bytes();
-            let mut len = 0;
-            for byte in bytes {
-                if b" \n\t(){};".contains(byte) {
-                    break;
-                }
-                len += 1;
-            }
-            if len == 0 {
-                len = 1;
-            }
-            let token = &self.text[..len];
-            self.text = &self.text[len..];
-            return Some(token);
+            };
+
+            let matcher = parse_matcher(input, !expect_semicolon)?;
+            let ParsedSymbolMatcher::Single(matcher) = matcher else {
+                let unexpected_extern = if matches!(matcher, ParsedSymbolMatcher::CxxMatchers(_)) {
+                    "C++"
+                } else {
+                    "C"
+                };
+                return Err(ContextError::from_external_error(
+                    input,
+                    VersionScriptError::UnexpectedExtern(unexpected_extern.to_string()),
+                ));
+            };
+
+            matchers.push(matcher);
         }
+
+        if cxx {
+            return Ok(ParsedSymbolMatcher::CxxMatchers(matchers));
+        }
+        return Ok(ParsedSymbolMatcher::Multiple(matchers));
     }
 
-    fn next_line(&mut self) -> Option<&'a str> {
-        while let Some(rest) = self.text.strip_prefix('\n') {
-            self.text = rest;
+    let token = if without_semicolon {
+        if input.contains(&b'}') {
+            take_until(1.., b'}').parse_next(input)?
+        } else {
+            // TODO: Clippy bug
+            #[allow(clippy::needless_borrow)]
+            &input
         }
-        if self.text.is_empty() {
-            return None;
-        }
-        let bytes = self.text.as_bytes();
-        let end_pos = memchr::memchr(b'\n', bytes).unwrap_or(bytes.len());
-        let (line, rest) = self.text.split_at(end_pos);
-        self.text = rest;
-        Some(line)
-    }
-
-    fn new(text: &'a str) -> Self {
-        Tokeniser { text }
-    }
-
-    fn expect(&mut self, expected: &str) -> Result {
-        let token = self
-            .next()
-            .ok_or_else(|| anyhow!("Expected token '{expected}', got end of input"))?;
-        if token != expected {
-            bail!("Expected token '{expected}', got '{token}'");
-        }
-        Ok(())
-    }
-}
-
-fn try_take(input: &mut &str, pattern: &str) -> bool {
-    if let Some(rest) = input.strip_prefix(pattern) {
-        *input = rest;
-        true
     } else {
-        false
+        take_until(1.., b';').parse_next(input)?
+    };
+
+    skip_comments_and_whitespace(input)?;
+
+    if input.starts_with(b";") {
+        ";".parse_next(input)?;
     }
+
+    let token = token.trim_ascii_end();
+
+    Ok(ParsedSymbolMatcher::Single(
+        if let Some(unquoted) = token
+            .strip_prefix(b"\"")
+            .and_then(|t| t.strip_suffix(b"\""))
+        {
+            SymbolMatcher::Exact(unquoted)
+        } else if token.contains(&b'\\') {
+            return Err(ContextError::from_external_error(
+                input,
+                VersionScriptError::GlobWithQuote,
+            ));
+        } else if token == b"*" {
+            SymbolMatcher::MatchesAll
+        } else if b"[]?*".iter().any(|c| token.contains(c)) {
+            let pattern = Pattern::new(str::from_utf8(token).map_err(|_| {
+                ContextError::from_external_error(input, VersionScriptError::InvalidUtf8String)
+            })?)
+            .map_err(|_: glob::PatternError| {
+                ContextError::from_external_error(input, VersionScriptError::InvalidGlobPattern)
+            })?;
+
+            if token.contains(&b'*') {
+                SymbolMatcher::StarGlob(pattern)
+            } else {
+                SymbolMatcher::NonstarGlob(pattern)
+            }
+        } else {
+            SymbolMatcher::Exact(token)
+        },
+    ))
 }
 
-fn take_up_to<'a>(input: &mut &'a str, pattern: &str) -> Result<&'a str> {
-    let end = input
-        .find(pattern)
-        .ok_or_else(|| anyhow!("Missing expected '{pattern}'"))?;
-    let content = &input[..end];
-    *input = &input[end + pattern.len()..];
-    Ok(content)
+fn parse_token<'input>(input: &mut &'input BStr) -> winnow::Result<&'input [u8]> {
+    take_while(1.., |b| !b" (){}\n\t".contains(&b)).parse_next(input)
+}
+
+#[derive(Debug)]
+enum VersionScriptError {
+    UnknownParentVersion,
+    InvalidUtf8String,
+    InvalidGlobPattern,
+    GlobWithQuote,
+    UnexpectedExtern(String),
+    UnsupportedExtern(String),
+}
+
+impl std::error::Error for VersionScriptError {}
+
+impl std::fmt::Display for VersionScriptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VersionScriptError::InvalidGlobPattern => write!(f, "Invalid glob pattern"),
+            VersionScriptError::GlobWithQuote => write!(f, "Globs with quote are unsupported"),
+            VersionScriptError::InvalidUtf8String => write!(f, "Invalid utf-8 string"),
+            VersionScriptError::UnknownParentVersion => write!(f, "Unknown parent version"),
+            VersionScriptError::UnexpectedExtern(s) => {
+                write!(f, "Unexpected extern \"{s}\" in parsing")
+            }
+            VersionScriptError::UnsupportedExtern(s) => write!(f, "Unsupported extern \"{s}\""),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -351,65 +585,61 @@ mod tests {
     use itertools::Itertools;
     use itertools::assert_equal;
 
-    #[test]
-    fn test_tokenisation() {
-        fn tokenise(text: &str) -> Vec<&str> {
-            let mut t = Tokeniser::new(text);
-            let mut out = Vec::new();
-            while let Some(token) = t.next() {
-                assert!(!token.is_empty());
-                out.push(token);
-            }
-            out
-        }
-
-        assert_eq!(tokenise("/**/ /* a */ GROUP ()"), vec!["GROUP", "(", ")"]);
-        assert_eq!(
-            tokenise("GROUP ( AS_NEEDED ( /a/b/c ))"),
-            vec!["GROUP", "(", "AS_NEEDED", "(", "/a/b/c", ")", ")"]
-        );
-        assert_eq!(tokenise(""), Vec::<&str>::new());
+    fn is_matching_global<'data>(script: &VersionScript<'data>, name: &str) -> bool {
+        let Some(m) = script.find_match(&UnversionedSymbolName::prehashed(name.as_bytes())) else {
+            return true;
+        };
+        matches!(m.1, VersionRuleSection::Global)
     }
 
     #[test]
     fn test_parse_simple_version_script() {
-        let data = VersionScriptData {
-            raw: r#"
+        let data = ScriptData {
+            raw: br#"
                     # Comment starting with a hash
                     {global:
                         /* Single-line comment */
                         foo; /* Trailing comment */
                         bar*;
+                        best_*_fn*;
+                        *_wrapper  ;
                     local:
                         /* Multi-line
                            comment */
                         *;
-                    }"#,
+                    };"#,
         };
         let script = VersionScript::parse(data).unwrap();
+        let version_body = &script.versions[0].version_body;
         assert_equal(
-            script
+            version_body
                 .globals
+                .general
                 .exact
                 .iter()
                 .map(|s| std::str::from_utf8(s.bytes()).unwrap()),
             ["foo"],
         );
         assert_equal(
-            script
+            version_body
                 .globals
-                .prefixes
+                .general
+                .star_globs
                 .iter()
-                .map(|s| std::str::from_utf8(s).unwrap()),
-            ["bar"],
+                .map(|glob| glob.as_str()),
+            ["bar*", "best_*_fn*", "*_wrapper"],
         );
-        assert!(script.locals.matches_all);
+
+        assert!(is_matching_global(&script, "main_wrapper"));
+        assert!(is_matching_global(&script, "bar_bar_bar"));
+        assert!(is_matching_global(&script, "best_foo_fn_barus"));
+        assert!(!is_matching_global(&script, "best_fn"));
     }
 
     #[test]
     fn test_parse_version_script() {
-        let data = VersionScriptData {
-            raw: r#"
+        let data = ScriptData {
+            raw: br#"
                 VERS_1.1 {
                     global:
                         foo1;
@@ -424,30 +654,15 @@ mod tests {
         };
         let script = VersionScript::parse(data).unwrap();
         assert_eq!(script.versions.len(), 3);
-        assert_equal(
-            script
-                .globals
-                .exact
-                .iter()
-                .map(|s| std::str::from_utf8(s.bytes()).unwrap())
-                .sorted(),
-            ["foo1", "foo2"],
-        );
-        assert_equal(
-            script
-                .locals
-                .prefixes
-                .iter()
-                .map(|s| std::str::from_utf8(s).unwrap()),
-            ["old"],
-        );
 
         let version = &script.versions[1];
-        assert_eq!(version.name, "VERS_1.1");
+        assert_eq!(version.name, b"VERS_1.1");
         assert_eq!(version.parent_index, None);
         assert_equal(
             version
-                .symbols
+                .version_body
+                .globals
+                .general
                 .exact
                 .iter()
                 .map(|s| std::str::from_utf8(s.bytes()).unwrap()),
@@ -455,23 +670,228 @@ mod tests {
         );
         assert_equal(
             version
-                .symbols
-                .prefixes
+                .version_body
+                .locals
+                .general
+                .star_globs
                 .iter()
-                .map(|s| std::str::from_utf8(s).unwrap()),
-            ["old"],
+                .map(|glob| glob.as_str()),
+            ["old*"],
         );
 
         let version = &script.versions[2];
-        assert_eq!(version.name, "VERS_1.2");
+        assert_eq!(version.name, b"VERS_1.2");
         assert_eq!(version.parent_index, Some(1));
         assert_equal(
             version
-                .symbols
+                .version_body
+                .globals
+                .general
                 .exact
                 .iter()
                 .map(|s| std::str::from_utf8(s.bytes()).unwrap()),
             ["foo2"],
         );
+    }
+
+    #[test]
+    fn single_line_version_script() {
+        let data = ScriptData {
+            raw: br#"VERSION42 { global: *; };"#,
+        };
+        VersionScript::parse(data).unwrap();
+    }
+
+    #[test]
+    fn extern_cxx_version_script() {
+        let data = ScriptData {
+            raw: br#"
+                "VERSION42 {
+                    local:
+                        foo;
+                        bar;
+                        extern "C++" {
+                            ns::*;
+                            "f(int**,double)";
+                            "std::vector<Loc<1>, std::allocator<Loc<1> > >::_M_realloc_append<Loc<1> const&>(Loc<1> const&)::_Guard_elts::_Guard_elts(Loc<1>*, std::allocator<Loc<1> >&)";
+                            "WebKit::WebProcessMain(int, char**)";
+                        };
+                };"#,
+        };
+        let script = VersionScript::parse(data).unwrap();
+        let version_body = &script.versions[1].version_body;
+
+        assert_equal(
+            version_body
+                .locals
+                .cxx
+                .exact
+                .iter()
+                .map(|s| std::str::from_utf8(s.bytes()).unwrap())
+                .sorted(),
+            [
+                "WebKit::WebProcessMain(int, char**)",
+                "f(int**,double)",
+                "std::vector<Loc<1>, std::allocator<Loc<1> > >::_M_realloc_append<Loc<1> const&>(Loc<1> const&)::_Guard_elts::_Guard_elts(Loc<1>*, std::allocator<Loc<1> >&)",
+            ],
+        );
+        assert_equal(
+            version_body
+                .locals
+                .cxx
+                .star_globs
+                .iter()
+                .map(|glob| glob.as_str()),
+            ["ns::*"],
+        );
+
+        assert!(!is_matching_global(&script, "foo"));
+        // Test "ns::" c++ namespace glob pattern.
+        assert!(!is_matching_global(
+            &script,
+            "_ZN2ns8generateB5cxx11ENSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEb"
+        ));
+        // Test exact matches after C++ demangling.
+        assert!(!is_matching_global(
+            &script,
+            "_ZZNSt6vectorI3LocILi1EESaIS1_EE17_M_realloc_appendIJRKS1_EEEvDpOT_EN11_Guard_eltsC2EPS1_RS2_"
+        ));
+        assert!(!is_matching_global(
+            &script,
+            "_ZN6WebKit14WebProcessMainEiPPc"
+        ));
+        assert!(is_matching_global(
+            &script,
+            "_ZTVN10__cxxabiv120__si_class_type_infoE"
+        ));
+    }
+
+    #[test]
+    fn extern_c_version_script() {
+        let data = ScriptData {
+            raw: br#"
+                "VERSION42 {
+                    local:
+                        foo;
+                        bar;
+                        extern "C" {
+                            baz;
+                        };
+                };"#,
+        };
+        let script = VersionScript::parse(data).unwrap();
+        let version_body = &script.versions[1].version_body;
+
+        assert_equal(
+            version_body
+                .locals
+                .general
+                .exact
+                .iter()
+                .map(|s| std::str::from_utf8(s.bytes()).unwrap())
+                .sorted(),
+            ["bar", "baz", "foo"],
+        );
+    }
+
+    #[test]
+    fn extern_without_semicolon_version_script() {
+        let data = ScriptData {
+            raw: br#"
+                {
+                    extern "C" {
+                        foo
+                    };
+                };"#,
+        };
+        let script = VersionScript::parse(data).unwrap();
+        let version_body = &script.versions[0].version_body;
+
+        assert_equal(
+            version_body
+                .globals
+                .general
+                .exact
+                .iter()
+                .map(|s| std::str::from_utf8(s.bytes()).unwrap()),
+            ["foo"],
+        );
+
+        let data = ScriptData {
+            raw: br#"
+                {
+                    extern "C++" {
+                        bar;
+                        baz
+                    };
+                };"#,
+        };
+        let script = VersionScript::parse(data).unwrap();
+        let version_body = &script.versions[0].version_body;
+
+        assert_equal(
+            version_body
+                .globals
+                .cxx
+                .exact
+                .iter()
+                .map(|s| std::str::from_utf8(s.bytes()).unwrap())
+                .sorted(),
+            ["bar", "baz"],
+        );
+    }
+
+    #[test]
+    fn invalid_version_scripts() {
+        #[track_caller]
+        fn assert_invalid(src: &str) {
+            let data = ScriptData {
+                raw: src.as_bytes(),
+            };
+            assert!(VersionScript::parse(data).is_err());
+        }
+
+        // Missing ';'
+        assert_invalid("{}");
+        assert_invalid("{*};");
+        assert_invalid("{foo};");
+
+        // Missing '}'
+        assert_invalid("{foo;");
+        assert_invalid("VER1 {foo;}; VER2 {bar;} VER1");
+
+        // Missing parent version
+        assert_invalid("VER2 {bar;} VER1;");
+    }
+
+    #[test]
+    fn test_version_order() {
+        let data = ScriptData {
+            raw: br#"
+                VERS_1.1 {
+                    foo;
+                    foo?;
+                    f*;
+                    bar*;
+                };
+
+                VERS_1.2 {
+                    foo*;
+                    bar;
+                } VERS_1.1;
+            "#,
+        };
+        let script = VersionScript::parse(data).unwrap();
+        let sym = UnversionedSymbolName::prehashed;
+
+        // Exact match wins
+        assert_eq!(script.find_match(&sym(b"foo")).unwrap().0, 1);
+        assert_eq!(script.find_match(&sym(b"bar")).unwrap().0, 2);
+
+        // Non-star match
+        assert_eq!(script.find_match(&sym(b"foox")).unwrap().0, 1);
+
+        // Star match
+        assert_eq!(script.find_match(&sym(b"foo_bar")).unwrap().0, 2);
     }
 }

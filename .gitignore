@@ -13,3 +13,8 @@ heaptrack*.zst
 .cargo/config.toml
 dhat-heap.json
 test-config.toml
+result
+# These are generated when running mold tests.
+fakes-debug/out
+fakes-debug/-
+/wild/out/test

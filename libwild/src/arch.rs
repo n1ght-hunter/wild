@@ -1,16 +1,20 @@
 //! Abstraction over different CPU architectures.
 
 use crate::args::OutputKind;
+use crate::bail;
 use crate::error::Result;
+use crate::layout::Layout;
+use crate::layout::PropertyClass;
 use crate::resolution::ValueFlags;
-use anyhow::bail;
 use linker_utils::elf::DynamicRelocationKind;
 use linker_utils::elf::RelocationKindInfo;
 use linker_utils::elf::SectionFlags;
 use linker_utils::relaxation::RelocationModifier;
 use object::elf::EM_AARCH64;
+use object::elf::EM_RISCV;
 use object::elf::EM_X86_64;
 use std::borrow::Cow;
+use std::fmt::Display;
 use std::str::FromStr;
 
 pub(crate) trait Arch {
@@ -30,35 +34,69 @@ pub(crate) trait Arch {
 
     // Get string representation of a relocation specific for the architecture.
     fn rel_type_to_string(r_type: u32) -> Cow<'static, str>;
+
+    // Get DTV OFFSET.
+    fn get_dtv_offset() -> u64 {
+        0
+    }
+
+    // Some architectures use debug info relocation that depend on local symbols.
+    fn local_symbols_in_debug_info() -> bool;
+
+    // Get position of the $tp (thread pointer) in the TLS section. Each platform defines
+    // a different place based on the following article:
+    // https://maskray.me/blog/2021-02-14-all-about-thread-local-storage#tls-variants
+    fn tp_offset_start(layout: &Layout) -> u64;
+
+    // Classify a GNU property note.
+    fn get_property_class(property_type: u32) -> Option<PropertyClass>;
+
+    // Merge e_flags of the input files and provide an error
+    // if the flags are not compatible.
+    fn merge_eflags(eflags: &[u32]) -> Result<u32>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Architecture {
     X86_64,
     AArch64,
+    RISCV64,
 }
 
 impl FromStr for Architecture {
-    type Err = anyhow::Error;
+    type Err = crate::error::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "elf_x86_64" => Ok(Architecture::X86_64),
             "aarch64elf" | "aarch64linux" => Ok(Architecture::AArch64),
+            "elf64lriscv" => Ok(Architecture::RISCV64),
             _ => bail!("-m {s} is not yet supported"),
         }
     }
 }
 
 impl TryFrom<u16> for Architecture {
-    type Error = anyhow::Error;
+    type Error = crate::error::Error;
 
     fn try_from(arch: u16) -> Result<Self, Self::Error> {
         match arch {
             EM_X86_64 => Ok(Self::X86_64),
             EM_AARCH64 => Ok(Self::AArch64),
+            EM_RISCV => Ok(Self::RISCV64),
             _ => bail!("Unsupported architecture: 0x{:x}", arch),
         }
+    }
+}
+
+impl Display for Architecture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let arch = match self {
+            Architecture::X86_64 => "x86_64",
+            Architecture::AArch64 => "aarch64",
+            Architecture::RISCV64 => "riscv64",
+        };
+        write!(f, "{arch}")
     }
 }
 
@@ -84,4 +122,6 @@ pub(crate) trait Relaxation {
     fn debug_kind(&self) -> impl std::fmt::Debug;
 
     fn next_modifier(&self) -> RelocationModifier;
+
+    fn is_mandatory(&self) -> bool;
 }

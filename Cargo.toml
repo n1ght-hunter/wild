@@ -13,9 +13,9 @@ resolver = "2"
 [workspace.package]
 repository = "https://github.com/davidlattimore/wild"
 license = "MIT OR Apache-2.0"
-version = "0.4.0"
+version = "0.5.0"
 readme = "README.md"
-rust-version = "1.86"
+rust-version = "1.88"
 edition = "2024"
 
 [workspace.dependencies]
@@ -29,14 +29,16 @@ bytemuck = { version = "1.10.0", features = ["derive"] }
 bytesize = "2.0.0"
 clap = { version = "4.0.0", features = ["derive"] }
 colored = "3.0.0"
+colosseum = "0.2.2"
 crossbeam-queue = "0.3.10"
 crossbeam-utils = "0.8.18"
+crossbeam-channel = "0.5.15"
 dhat = { version = "0.3.3" }
 fallible-iterator = "0.3.0"
 fd-lock = "4.0.0"
 flate2 = { version = "1.1.0", features = ["zlib-rs"] }
 foldhash = "0.1.0"
-gimli = "0.31.0"
+gimli = "0.32.0"
 hashbrown = "0.15.1"
 hex = "0.4.0"
 iced-x86 = { version = "1.17.0", default-features = false, features = [
@@ -44,13 +46,15 @@ iced-x86 = { version = "1.17.0", default-features = false, features = [
     "decoder",
     "gas",
 ] }
+indexmap = "2.9.0"
 itertools = "0.14.0"
+jobserver = "0.1.23"
+leb128 = "0.2.5"
 libc = "0.2.152"
 memchr = "2.6.0"
 memmap2 = "0.9.0"
 mimalloc = { version = "0.1", default-features = false }
-normalize-path = "0.2.0"
-object = { version = "0.36.7", default-features = false, features = [
+object = { version = "0.37.3", default-features = false, features = [
     "elf",
     "read_core",
     "std",
@@ -58,29 +62,30 @@ object = { version = "0.36.7", default-features = false, features = [
     "archive",
 ] }
 os_info = "3.0.0"
+perf-event = "0.4.8"
 postcard = { version = "1.1.1", features = ["use-std"] }
 rayon = "1.2.1"
-rstest = "0.25.0"
+rstest = "0.26.1"
 serde = { version = "1.0.219", features = ["derive"] }
 sharded-offset-map = "0.2.0"
 sharded-vec-writer = "0.3.0"
 smallvec = "1.6.1"
 strum = { version = "0.27.0", features = ["derive"] }
 strum_macros = "0.27.0"
+symbolic-common = "12.0.0"
 symbolic-demangle = "12.0.0"
 tempfile = "3.0.2"
-toml = "0.8.0"
+toml = "0.9.0"
 tracing = "0.1.35"
 tracing-subscriber = { version = "0.3.16", default-features = false, features = [
     "env-filter",
     "fmt",
     "registry",
 ] }
-typed-arena = "2.0.0"
 uuid = { version = "1.0.0", features = ["v4"] }
 wait-timeout = "0.2.0"
-which = "7.0.2"
-winnow = "0.7.0"
+which = "8.0.0"
+winnow = { version = "0.7.0", features = ["simd"] }
 zstd = "0.13.0"
 
 [profile.opt-debug]
@@ -153,7 +158,7 @@ iter_not_returning_iterator = "allow"
 
 # Indexing into a vec may panic. That's true, and if it does, that's a bug. The fact that we're
 # matching on the element of the vec is irrelevant.
-match_on_vec_items = "allow"
+indexing_slicing = "allow"
 
 # Sometimes you have a comment on one arm that doesn't apply to the other arms. Clippy isn't smart
 # enough to see that the comment is what is different.
@@ -181,10 +186,6 @@ too_many_lines = "allow"
 
 # Some of our tests do this and there doesn't seem to be much value in changing them.
 unreadable_literal = "allow"
-
-# This lint has false positives.
-# https://github.com/rust-lang/rust-clippy/issues/14192#issuecomment-2777602132
-manual_slice_fill = "allow"
 
 trivially_copy_pass_by_ref = "warn"
 uninlined_format_args = "warn"

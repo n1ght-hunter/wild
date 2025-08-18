@@ -31,33 +31,52 @@ To run tests (and have them pass) there are a number of pre-requisites to have i
 * `x86_64-unknown-linux-musl` target for the nightly toolchain (add
   with `rustup target add --toolchain nightly x86_64-unknown-linux-musl`)
 * cranelift backend (add with `rustup component add rustc-codegen-cranelift-preview --toolchain nightly`)
+* `clang-format` formatter
 
 then use `cargo test` as usual.
 
-## Running aarch64 tests on x86_64
+## Running tests for other architectures on x86_64
 
-Some, but currently not all, of the tests that run on aarch64 can be run on x86_64.
+Wild supports testing on non-native architectures using QEMU.
 
-Setup procedure:
+### Setup
 
-* `rustup target add --toolchain nightly aarch64-unknown-linux-gnu aarch64-unknown-linux-musl`
-* For apt-based systems:
-  * `sudo apt install qemu-user gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu build-essential`
+1. Add required Rust targets:
 
-Then when running tests:
+  ```sh
+  # For aarch64
+  rustup target add --toolchain nightly aarch64-unknown-linux-gnu aarch64-unknown-linux-musl
+
+  # For riscv64
+  rustup target add --toolchain nightly riscv64gc-unknown-linux-gnu riscv64gc-unknown-linux-musl
+  ```
+
+2. Install required packages (for apt-based systems):
+
+  ```sh
+  # For aarch64
+  sudo apt install qemu-user gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+  # For riscv64
+  sudo apt install qemu-user gcc-riscv64-linux-gnu g++-riscv64-linux-gnu binutils-riscv64-linux-gnu
+  ```
+
+### Running tests
+
+To run tests for a specific architecture:
 
 ```sh
+# For aarch64
 WILD_TEST_CROSS=aarch64 cargo test
+
+# For riscv64
+WILD_TEST_CROSS=riscv64 cargo test
+
+# All
+WILD_TEST_CROSS=aarch64,riscv64 cargo test
 ```
 
-This will run both the host-native tests (x86_64) as well as many of the same tests, but on aarch64.
-Qemu is used for running the binaries produced by the linker. All compilation, linking and diffing
-however is done natively on the host system, so should run at full speed.
-
-Cross compilation is currently only done with GCC and rustc, so clang-based tests currently all
-disable cross compilation.
-
-Cross compilation is set up in docker/debian.Dockerfile.
+This runs both native tests and architecture-specific tests. QEMU is used for executing binaries for non-native, while linking and diffing are performed natively. Note that cross-compilation only works with GCC and rustc tests; clang-based tests currently disable cross-compilation.
 
 ## Configuration file for tests
 
@@ -66,9 +85,9 @@ Currently, the behavior for the following test options can be configured using t
 - `rustc_channel`: Specifies which Rust compiler channel to use when running tests that build Rust
   code. The default value is "default", which means no explicit toolchain is specified.
 
-- `use_qemu`: Determines whether to run tests for architectures different from the host. This
+- `qemu_arch`: List of additional architectures (different from the host) to run tests for. This
   setting is overridden by the `$WILD_TEST_CROSS` environment variable. The default value is
-  `false`.
+  `[]`.
 
 - `allow_rust_musl_target`: Specifies whether to allow the musl target Rust. The default value is
   `false`, so you’ll need to set it to `true` if you want to run tests targeting musl.
@@ -82,6 +101,49 @@ file, specify its location using the `WILD_TEST_CONFIG` environment variable as 
 
 ```sh
 WILD_TEST_CONFIG=path_to_config cargo test
+```
+
+## Coding style for tests
+
+C and C++ files follow Google style from clang-format that is enforced by an unit test. You can use the following command to format them:
+
+```sh
+clang-format -i wild/tests/sources/*.{c,cc,h}
+```
+
+When working on tests, you can temporarily disable the formatting check by setting the `WILD_TEST_IGNORE_FORMAT` environment variable.
+
+## Running external tests
+
+Wild can run some external test suites. Currently only the test suite of mold is supported.
+
+You can run the mold tests as follows:
+
+```sh
+# Clone the mold repository (only needed once)
+git submodule update --init --recursive
+
+cargo test --features mold_tests
+```
+
+You can use this command instead of the second one to run all external tests together:
+
+```sh
+cargo test --features external_tests
+```
+
+Some tests are configured to be skipped by default. A list of these skipped tests can be found at:
+
+[wild/tests/external_tests/mold_skip_tests.toml](./wild/tests/external_tests/mold_skip_tests.toml): for the mold tests.
+
+However, you can also run the tests without skipping any of them:
+
+```sh
+# Run mold tests without skipping any test
+WILD_IGNORE_SKIP=mold cargo test --features mold_tests
+
+# Run all external tests without skipping any test
+WILD_IGNORE_SKIP=all cargo test --features external_tests
 ```
 
 ## GitHub workflow
@@ -114,6 +176,12 @@ you'll need to format with nightly. Before you upload your PR, you should run th
 ```sh
 cargo +nightly fmt
 ```
+
+### Naming
+
+When in doubt, do what is done in the Rust standard library. e.g. when making a name CamelCase, only
+the first letter of each "word" should be uppercase even if the "word" is an acronym. You can see
+this in the standard library with types like `TcpStream` and `IoSlice`.
 
 ### One import per line
 

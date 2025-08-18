@@ -1,10 +1,10 @@
 /// # Safety
 /// See function of the same name in `subprocess.rs`
-pub unsafe fn run_in_subprocess(args: &crate::Args) -> ! {
+pub unsafe fn run_in_subprocess(args: crate::Args) -> ! {
     let exit_code = match crate::run(args) {
         Ok(()) => 0,
         Err(error) => {
-            eprintln!("{error}");
+            eprintln!("{}", error.to_string());
             -1
         }
     };

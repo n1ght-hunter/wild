@@ -1,7 +1,5 @@
-//#LinkerScript:linker-script.ld
-//#Static:false
-//#LinkArgs:-shared -z now
-//#RunEnabled:false
+//#Mode:dynamic
+//#LinkArgs:-shared -z now -T ./linker-script.ld
 //#DiffIgnore:section.got
 //#ExpectDynSym:start_bar bar 0
 //#ExpectDynSym:start_aaa bar 8
@@ -9,9 +7,10 @@
 //#ExpectSym:start_bar bar 0
 //#ExpectSym:start_aaa bar 8
 //#ExpectSym:end_bar bar 12
+//#DiffIgnore:section.riscv.attributes
 
-static int foo1 __attribute__ ((used, section (".data.foo"))) = 0x01;
+static int foo1 __attribute__((used, section(".data.foo"))) = 0x01;
 
-static int baz1 __attribute__ ((used, section (".data.baz1"))) = 0x02;
+static int baz1 __attribute__((used, section(".data.baz1"))) = 0x02;
 
-static int aaa1 __attribute__ ((used, section (".data.aaa"))) = 0x03;
+static int aaa1 __attribute__((used, section(".data.aaa"))) = 0x03;

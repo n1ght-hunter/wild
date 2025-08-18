@@ -1,5 +1,6 @@
 use crate::Binary;
 use crate::Result;
+use crate::asm_diff::BasicValueKind;
 use anyhow::Context;
 use anyhow::bail;
 use linker_utils::elf::BitMask;
@@ -16,6 +17,7 @@ use std::ops::Range;
 pub(crate) enum ArchKind {
     X86_64,
     Aarch64,
+    RISCV64,
 }
 
 /// Provides architecture-specific functionality needed by linker-diff.
@@ -99,7 +101,7 @@ pub(crate) trait Arch: Clone + Copy + Eq + PartialEq + Debug {
         section_address: u64,
         function_offset_in_section: u64,
         range: Range<u64>,
-    ) -> Vec<Instruction<Self>>;
+    ) -> Vec<Instruction<'_, Self>>;
 
     fn decode_plt_entry(plt_entry: &[u8], plt_base: u64, plt_offset: u64) -> Option<PltEntry>;
 
@@ -130,6 +132,9 @@ pub(crate) trait Arch: Clone + Copy + Eq + PartialEq + Debug {
     /// that the address of foo is 0x12???, then a later relocation might tell us the low bits, so
     /// that we know the full address is 0x12345.
     fn is_complete_chain(chain: impl Iterator<Item = Self::RType>) -> bool;
+
+    /// Returns a `BasicValueKind` type that corresponds to a `RelocationKind::TpOff` relocation.
+    fn get_basic_value_for_tp_offset() -> BasicValueKind;
 }
 
 pub(crate) trait RType: Copy + Debug + Display + Eq + PartialEq {
@@ -266,6 +271,7 @@ impl ArchKind {
         match bins[0].elf_file.elf_header().e_machine(LittleEndian) {
             object::elf::EM_X86_64 => Ok(ArchKind::X86_64),
             object::elf::EM_AARCH64 => Ok(ArchKind::Aarch64),
+            object::elf::EM_RISCV => Ok(ArchKind::RISCV64),
             other => bail!("Unsupported object architecture {other}",),
         }
     }

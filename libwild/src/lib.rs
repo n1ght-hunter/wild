@@ -2,15 +2,17 @@ pub(crate) mod aarch64;
 pub(crate) mod alignment;
 pub(crate) mod arch;
 pub(crate) mod archive;
-pub(crate) mod archive_splitter;
 pub mod args;
 pub(crate) mod debug_trace;
 pub(crate) mod diagnostics;
 pub(crate) mod diff;
+pub(crate) mod dwarf_address_info;
 pub(crate) mod elf;
 pub(crate) mod elf_writer;
 pub mod error;
+pub(crate) mod export_list;
 pub(crate) mod file_kind;
+pub(crate) mod file_writer;
 pub(crate) mod fs;
 pub(crate) mod gc_stats;
 pub(crate) mod grouping;
@@ -26,11 +28,16 @@ pub(crate) mod output_section_part_map;
 pub(crate) mod output_trace;
 pub(crate) mod parsing;
 pub(crate) mod part_id;
+#[cfg(target_os = "linux")]
+pub(crate) mod perf;
+#[cfg(not(target_os = "linux"))]
+#[path = "perf_unsupported.rs"]
+pub(crate) mod perf;
 pub(crate) mod program_segments;
 pub(crate) mod resolution;
+pub(crate) mod riscv64;
 pub(crate) mod save_dir;
 pub(crate) mod sharding;
-pub(crate) mod slice;
 pub(crate) mod string_merging;
 #[cfg(all(feature = "fork", not(target_os = "windows")))]
 pub(crate) mod subprocess;
@@ -45,7 +52,9 @@ pub(crate) mod verification;
 pub(crate) mod version_script;
 pub(crate) mod x86_64;
 
+use crate::args::ActivatedArgs;
 pub use args::Args;
+use colosseum::sync::Arena;
 use crossbeam_utils::atomic::AtomicCell;
 use error::AlreadyInitialised;
 use input_data::InputData;
@@ -53,20 +62,23 @@ use input_data::InputFile;
 use input_data::InputLinkerScript;
 use layout_rules::LayoutRules;
 use output_section_id::OutputSections;
+use std::sync::atomic::Ordering;
 pub use subprocess::run_in_subprocess;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use typed_arena::Arena;
 
 /// Runs the linker and cleans up associated resources. Only use this function if you've OK with
 /// waiting for cleanup.
-pub fn run(args: &Args) -> error::Result {
-    setup_tracing(args)?;
-    setup_thread_pool(args)?;
+pub fn run(args: Args) -> error::Result {
+    // Note, we need to setup tracing before we activate the thread pool. In particular, we need to
+    // initialise the timing module before the worker threads are started, otherwise the threads
+    // won't contribute to counters such as --time=cycles,instructions etc.
+    setup_tracing(&args)?;
+    let args = args.activate_thread_pool()?;
     let linker = Linker::new();
-    linker.run(args)?;
+    linker.run(&args)?;
     Ok(())
 }
 
@@ -74,8 +86,8 @@ pub fn run(args: &Args) -> error::Result {
 /// called once and only if nothing else has already set the global tracing dispatcher. Calling this
 /// is optional. If it isn't called, no tracing-based features will function. e.g. --time.
 pub fn setup_tracing(args: &Args) -> Result<(), AlreadyInitialised> {
-    if args.time_phases {
-        timing::init_tracing()
+    if let Some(opts) = args.time_phase_options.as_ref() {
+        timing::init_tracing(opts)
     } else if args.print_allocations.is_some() {
         debug_trace::init()
     } else {
@@ -85,13 +97,6 @@ pub fn setup_tracing(args: &Args) -> Result<(), AlreadyInitialised> {
             .try_init()
             .map_err(|_| AlreadyInitialised)
     }
-}
-
-/// Sets up the global thread pool based on the supplied arguments, in particular --threads. This
-/// can only be called once. Calling this at all is optional. If it isn't called, then a default
-/// thread pool will be used - i.e. any argument to --threads will be ignored.
-pub fn setup_thread_pool(args: &Args) -> error::Result {
-    args.setup_thread_pool()
 }
 
 /// This is effectively a data store for use while linking. It takes ownership of all the input data
@@ -127,7 +132,7 @@ impl Linker {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
-            inputs: Default::default(),
+            inputs: Arena::new(),
             herd: Default::default(),
             shutdown_scope: Default::default(),
             _link_scope: tracing::info_span!("Link").entered(),
@@ -139,8 +144,9 @@ impl Linker {
     /// return, the output file should be usable.
     pub fn run<'layout_inputs>(
         &'layout_inputs self,
-        args: &'layout_inputs Args,
+        args: &'layout_inputs ActivatedArgs,
     ) -> error::Result<LinkerOutput<'layout_inputs>> {
+        let args = &args.args;
         if args.should_print_version {
             println!(
                 "Wild version {} (compatible with GNU linkers)",
@@ -154,6 +160,7 @@ impl Linker {
         match args.arch {
             arch::Architecture::X86_64 => self.link_for_arch::<x86_64::X86_64>(args),
             arch::Architecture::AArch64 => self.link_for_arch::<aarch64::AArch64>(args),
+            arch::Architecture::RISCV64 => self.link_for_arch::<riscv64::RiscV64>(args),
         }
     }
 
@@ -161,13 +168,13 @@ impl Linker {
         &'layout_inputs self,
         args: &'layout_inputs Args,
     ) -> error::Result<LinkerOutput<'layout_inputs>> {
-        let output = elf_writer::Output::new(args);
+        let output = file_writer::Output::new(args);
 
-        let (input_data, linker_scripts) = input_data::InputData::from_args(args, &self.inputs)?;
+        let input_data = input_data::InputData::from_args(args, &self.inputs)?;
 
         // Note, we propagate errors from `link_with_input_data` after we've checked if any files
         // changed. We want inputs-changed errors to take precedence over all other errors.
-        let result = self.link_with_input_data::<A>(output, &input_data, &linker_scripts, args);
+        let result = self.link_with_input_data::<A>(output, &input_data, args);
 
         input_data.verify_inputs_unchanged()?;
 
@@ -176,29 +183,35 @@ impl Linker {
 
     fn link_with_input_data<'data, A: arch::Arch>(
         &'data self,
-        mut output: elf_writer::Output,
+        mut output: file_writer::Output,
         input_data: &InputData<'data>,
-        linker_scripts: &[InputLinkerScript<'data>],
         args: &'data Args,
     ) -> error::Result<LinkerOutput<'data>> {
-        let inputs = archive_splitter::split_archives(input_data)?;
         let mut output_sections = OutputSections::with_base_address(args.base_address());
 
-        let (parsed_inputs, layout_rules) = parsing::parse_input_files(
-            &inputs,
-            linker_scripts,
-            args,
-            &mut output_sections,
-            &self.herd,
-        )?;
+        if args.output_kind().is_static_executable()
+            && input_data
+                .inputs
+                .iter()
+                .any(|input| input.kind == crate::file_kind::FileKind::ElfDynamic)
+        {
+            args.is_dynamic_executable.store(true, Ordering::Relaxed);
+        }
 
-        let groups = grouping::group_files(parsed_inputs, args);
+        let (linker_scripts, layout_rules) =
+            parsing::process_linker_scripts(&input_data.linker_scripts, &mut output_sections)?;
+
+        let parsed_inputs = parsing::parse_input_files(&input_data.inputs, linker_scripts, args)?;
+
+        let groups = grouping::group_files(parsed_inputs, args, &self.herd);
 
         let mut symbol_db = symbol_db::SymbolDb::build(
             groups,
             input_data.version_script_data,
             args,
-            linker_scripts,
+            &input_data.linker_scripts,
+            &self.herd,
+            input_data.export_list_data,
         )?;
 
         let resolved = resolution::resolve_symbols_and_sections(
@@ -208,9 +221,15 @@ impl Linker {
             &layout_rules,
         )?;
 
-        let layout = layout::compute::<A>(symbol_db, resolved, output_sections, &mut output)?;
+        let layout = layout::compute::<A>(
+            symbol_db,
+            resolved,
+            output_sections,
+            &mut output,
+            input_data,
+        )?;
 
-        output.write::<A>(&layout)?;
+        output.write(&layout, elf_writer::write::<A>)?;
         diff::maybe_diff()?;
 
         // We've finished linking. We consider everything from this point onwards as shutdown.
@@ -233,7 +252,7 @@ impl Default for Linker {
 impl Drop for Linker {
     fn drop(&mut self) {
         let _span = tracing::info_span!("Drop inputs").entered();
-        self.inputs = Default::default();
+        self.inputs = Arena::new();
         self.herd = Default::default();
     }
 }

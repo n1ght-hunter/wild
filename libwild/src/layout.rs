@@ -14,17 +14,28 @@ use crate::arch::Relaxation as _;
 use crate::args::Args;
 use crate::args::BuildIdOption;
 use crate::args::OutputKind;
+use crate::bail;
 use crate::debug_assert_bail;
 use crate::diagnostics::SymbolInfoPrinter;
 use crate::elf;
+use crate::elf::DynamicRelocationSequence;
 use crate::elf::EhFrameHdrEntry;
 use crate::elf::File;
 use crate::elf::FileHeader;
+use crate::elf::RelocationList;
+use crate::elf::RelocationSequence;
 use crate::elf::Versym;
 use crate::elf_writer;
+use crate::ensure;
+use crate::error;
+use crate::error::Context;
 use crate::error::Error;
 use crate::error::Result;
+use crate::error::warning;
+use crate::file_writer;
+use crate::grouping::Group;
 use crate::input_data::FileId;
+use crate::input_data::InputData;
 use crate::input_data::InputRef;
 use crate::input_data::PRELUDE_FILE_ID;
 use crate::layout_rules::SectionKind;
@@ -37,6 +48,7 @@ use crate::output_section_id::OutputSections;
 use crate::output_section_map::OutputSectionMap;
 use crate::output_section_part_map::OutputSectionPartMap;
 use crate::parsing::InternalSymDefInfo;
+use crate::parsing::SymbolPlacement;
 use crate::part_id;
 use crate::part_id::NUM_SINGLE_PART_SECTIONS;
 use crate::part_id::PartId;
@@ -61,33 +73,34 @@ use crate::symbol_db::SymbolDebug;
 use crate::symbol_db::SymbolId;
 use crate::symbol_db::SymbolIdRange;
 use crate::symbol_db::is_mapping_symbol_name;
-use anyhow::Context;
-use anyhow::anyhow;
-use anyhow::bail;
-use anyhow::ensure;
 use bitflags::bitflags;
 use crossbeam_queue::ArrayQueue;
 use crossbeam_queue::SegQueue;
+use indexmap::IndexMap;
 use itertools::Itertools;
+use linker_utils::elf::RISCV_ATTRIBUTE_VENDOR_NAME;
 use linker_utils::elf::RelocationKind;
 use linker_utils::elf::SectionFlags;
 use linker_utils::elf::SectionType;
 use linker_utils::elf::pt;
+use linker_utils::elf::riscvattr::TAG_RISCV_ARCH;
+use linker_utils::elf::riscvattr::TAG_RISCV_ATOMIC_ABI;
+use linker_utils::elf::riscvattr::TAG_RISCV_PRIV_SPEC;
+use linker_utils::elf::riscvattr::TAG_RISCV_PRIV_SPEC_MINOR;
+use linker_utils::elf::riscvattr::TAG_RISCV_PRIV_SPEC_REVISION;
+use linker_utils::elf::riscvattr::TAG_RISCV_STACK_ALIGN;
+use linker_utils::elf::riscvattr::TAG_RISCV_UNALIGNED_ACCESS;
+use linker_utils::elf::riscvattr::TAG_RISCV_WHOLE_FILE;
+use linker_utils::elf::riscvattr::TAG_RISCV_X3_REG_USAGE;
+use linker_utils::elf::secnames;
 use linker_utils::elf::shf;
+use linker_utils::elf::sht;
 use linker_utils::relaxation::RelocationModifier;
 use object::LittleEndian;
 use object::SectionIndex;
-use object::elf::GNU_PROPERTY_AARCH64_FEATURE_1_AND;
-use object::elf::GNU_PROPERTY_X86_UINT32_AND_HI;
-use object::elf::GNU_PROPERTY_X86_UINT32_AND_LO;
-use object::elf::GNU_PROPERTY_X86_UINT32_OR_AND_HI;
-use object::elf::GNU_PROPERTY_X86_UINT32_OR_AND_LO;
-use object::elf::GNU_PROPERTY_X86_UINT32_OR_HI;
-use object::elf::GNU_PROPERTY_X86_UINT32_OR_LO;
-use object::elf::Rela64;
 use object::elf::gnu_hash;
+use object::read::elf::Crel;
 use object::read::elf::Dyn as _;
-use object::read::elf::Rela as _;
 use object::read::elf::RelocationSections;
 use object::read::elf::SectionHeader as _;
 use object::read::elf::Sym;
@@ -99,14 +112,17 @@ use rayon::iter::ParallelIterator;
 use rayon::slice::ParallelSliceMut;
 use smallvec::SmallVec;
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::ffi::CString;
 use std::fmt::Display;
+use std::io::Cursor;
 use std::mem::replace;
 use std::mem::size_of;
 use std::mem::swap;
 use std::mem::take;
 use std::num::NonZeroU32;
 use std::num::NonZeroU64;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic;
 use std::sync::atomic::AtomicBool;
@@ -114,11 +130,12 @@ use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 
 #[tracing::instrument(skip_all, name = "Layout")]
-pub fn compute<'data, 'symbol_db, A: Arch>(
+pub fn compute<'data, A: Arch>(
     symbol_db: SymbolDb<'data>,
     resolved: ResolutionOutputs<'data>,
     mut output_sections: OutputSections<'data>,
-    output: &mut elf_writer::Output,
+    output: &mut file_writer::Output,
+    input_data: &InputData<'data>,
 ) -> Result<Layout<'data>> {
     let ResolutionOutputs {
         groups,
@@ -137,13 +154,16 @@ pub fn compute<'data, 'symbol_db, A: Arch>(
         &output_sections,
         &symbol_resolution_flags,
         &merged_strings,
+        input_data,
     )?;
 
     let mut group_states = gc_outputs.group_states;
 
     finalise_copy_relocations(&mut group_states, &symbol_db, &symbol_resolution_flags)?;
     merge_dynamic_symbol_definitions(&mut group_states)?;
-    merge_gnu_property_notes(&mut group_states)?;
+    merge_gnu_property_notes::<A>(&mut group_states)?;
+    merge_eflags::<A>(&mut group_states)?;
+    merge_riscv_attributes::<A>(&mut group_states)?;
 
     finalise_all_sizes(
         &symbol_db,
@@ -161,7 +181,7 @@ pub fn compute<'data, 'symbol_db, A: Arch>(
         .map(|f| f.into_non_atomic())
         .collect();
 
-    let non_addressable_counts = apply_non_addressable_indexes(&mut group_states, symbol_db.args)?;
+    let non_addressable_counts = apply_non_addressable_indexes(&mut group_states, &symbol_db)?;
 
     propagate_section_attributes(&group_states, &mut output_sections);
 
@@ -329,6 +349,17 @@ fn finalise_all_sizes<'data>(
     })
 }
 
+fn get_prelude_mut<'a, 'data>(
+    group_states: &'a mut [GroupState<'data>],
+) -> &'a mut PreludeLayoutState<'data> {
+    let Some(FileLayoutState::Prelude(prelude)) =
+        group_states.first_mut().and_then(|g| g.files.first_mut())
+    else {
+        panic!("Internal error, prelude must be first");
+    };
+    prelude
+}
+
 fn get_epilogue_mut<'a, 'data>(
     group_states: &'a mut [GroupState<'data>],
 ) -> &'a mut EpilogueLayoutState<'data> {
@@ -352,7 +383,7 @@ fn merge_dynamic_symbol_definitions(group_states: &mut [GroupState]) -> Result {
     Ok(())
 }
 
-enum PropertyClass {
+pub(crate) enum PropertyClass {
     // A bit in the output pr_data is set if it is set in any relocatable input.
     // If all bits in the output pr_data field are zero, this property should be removed from output.
     Or,
@@ -366,20 +397,8 @@ enum PropertyClass {
     AndOr,
 }
 
-fn get_property_class(property_type: u32) -> Option<PropertyClass> {
-    match property_type {
-        GNU_PROPERTY_X86_UINT32_AND_LO..=GNU_PROPERTY_X86_UINT32_AND_HI => Some(PropertyClass::And),
-        GNU_PROPERTY_AARCH64_FEATURE_1_AND => Some(PropertyClass::And),
-        GNU_PROPERTY_X86_UINT32_OR_LO..=GNU_PROPERTY_X86_UINT32_OR_HI => Some(PropertyClass::Or),
-        GNU_PROPERTY_X86_UINT32_OR_AND_LO..=GNU_PROPERTY_X86_UINT32_OR_AND_HI => {
-            Some(PropertyClass::AndOr)
-        }
-        _ => None,
-    }
-}
-
 #[tracing::instrument(skip_all, name = "Merge GNU property notes")]
-fn merge_gnu_property_notes(group_states: &mut [GroupState]) -> Result {
+fn merge_gnu_property_notes<A: Arch>(group_states: &mut [GroupState]) -> Result {
     let properties_per_file = group_states
         .iter()
         .flat_map(|group| {
@@ -393,24 +412,23 @@ fn merge_gnu_property_notes(group_states: &mut [GroupState]) -> Result {
         })
         .collect_vec();
 
-    // Merge bits of each property type based on type: OR or AND operation. When a property type
-    // is newly added to the map, we start either with zero or all bits-set (PropertyClass::And).
+    // Merge bits of each property type based on type: OR or AND operation.
     let mut property_map = HashMap::new();
+
     for file_props in &properties_per_file {
         for prop in *file_props {
-            let property_class = get_property_class(prop.ptype).ok_or_else(|| {
-                anyhow::anyhow!(format!("unclassified property type {}", prop.ptype))
-            })?;
+            let property_class = A::get_property_class(prop.ptype)
+                .ok_or_else(|| crate::error!("unclassified property type {}", prop.ptype))?;
             property_map
                 .entry(prop.ptype)
-                .and_modify(|e| {
+                .and_modify(|entry: &mut (u32, PropertyClass)| {
                     if matches!(property_class, PropertyClass::And) {
-                        *e &= prop.data;
+                        entry.0 &= prop.data;
                     } else {
-                        *e |= prop.data;
+                        entry.0 |= prop.data;
                     }
                 })
-                .or_insert_with(|| prop.data);
+                .or_insert_with(|| (prop.data, property_class));
         }
     }
 
@@ -418,8 +436,7 @@ fn merge_gnu_property_notes(group_states: &mut [GroupState]) -> Result {
     let output_properties = property_map
         .into_iter()
         .sorted_by_key(|x| x.0)
-        .filter_map(|(property_type, property_value)| {
-            let property_class = get_property_class(property_type).unwrap();
+        .filter_map(|(property_type, (property_value, property_class))| {
             let type_present_in_all = properties_per_file.iter().all(|props_per_file| {
                 props_per_file
                     .iter()
@@ -442,6 +459,144 @@ fn merge_gnu_property_notes(group_states: &mut [GroupState]) -> Result {
 
     let epilogue = get_epilogue_mut(group_states);
     epilogue.gnu_property_notes = output_properties;
+    Ok(())
+}
+
+#[tracing::instrument(skip_all, name = "Merge e_flags")]
+fn merge_eflags<A: Arch>(group_states: &mut [GroupState]) -> Result {
+    let eflags = group_states
+        .iter()
+        .flat_map(|group| {
+            group.files.iter().filter_map(|file| {
+                if let FileLayoutState::Object(object) = file {
+                    Some(object.object.eflags)
+                } else {
+                    None
+                }
+            })
+        })
+        .collect_vec();
+
+    let prelude = get_prelude_mut(group_states);
+    prelude.eflags = A::merge_eflags(&eflags)?;
+    Ok(())
+}
+
+#[tracing::instrument(skip_all, name = "Merge .riscv.attributes sections")]
+fn merge_riscv_attributes<A: Arch>(group_states: &mut [GroupState]) -> Result {
+    let attributes = group_states
+        .iter()
+        .flat_map(|group| {
+            group.files.iter().filter_map(|file| {
+                if let FileLayoutState::Object(object) = file {
+                    Some(&object.riscv_attributes)
+                } else {
+                    None
+                }
+            })
+        })
+        // Sort by the number of ISAs: better output ordering
+        .sorted_by_key(|x| x.len())
+        .rev()
+        .flatten()
+        .collect_vec();
+
+    let mut merged = Vec::new();
+
+    let mut arch_components = IndexMap::new();
+    for (name, version) in attributes
+        .iter()
+        .filter_map(|a| {
+            if let RiscVAttribute::Arch(arch) = a {
+                Some(&arch.map)
+            } else {
+                None
+            }
+        })
+        .flatten()
+    {
+        // Right now, we merge all the ISA extensions and use the maximum version.
+        // TODO: Add more verifier that rejects invalid combination of extensions.
+        arch_components
+            .entry(name.clone())
+            .and_modify(|v: &mut (u64, u64)| *v = (*v).max(*version))
+            .or_insert(*version);
+    }
+    if !arch_components.is_empty() {
+        merged.push(RiscVAttribute::Arch(RiscVArch {
+            map: arch_components,
+        }));
+    }
+
+    if let Some(align) = attributes
+        .iter()
+        .filter_map(|a| {
+            if let RiscVAttribute::StackAlign(align) = a {
+                Some(align)
+            } else {
+                None
+            }
+        })
+        .max()
+    {
+        merged.push(RiscVAttribute::StackAlign(*align));
+    }
+    if let Some(access) = attributes
+        .iter()
+        .filter_map(|a| {
+            if let RiscVAttribute::UnalignedAccess(access) = a {
+                Some(access)
+            } else {
+                None
+            }
+        })
+        .max()
+    {
+        merged.push(RiscVAttribute::UnalignedAccess(*access));
+    }
+    if let Some(version) = attributes
+        .iter()
+        .filter_map(|a| {
+            if let RiscVAttribute::PrivilegedSpecMajor(version) = a {
+                Some(version)
+            } else {
+                None
+            }
+        })
+        .max()
+    {
+        merged.push(RiscVAttribute::PrivilegedSpecMajor(*version));
+    }
+    if let Some(version) = attributes
+        .iter()
+        .filter_map(|a| {
+            if let RiscVAttribute::PrivilegedSpecMinor(version) = a {
+                Some(version)
+            } else {
+                None
+            }
+        })
+        .max()
+    {
+        merged.push(RiscVAttribute::PrivilegedSpecMinor(*version));
+    }
+    if let Some(version) = attributes
+        .iter()
+        .filter_map(|a| {
+            if let RiscVAttribute::PrivilegedSpecRevision(version) = a {
+                Some(version)
+            } else {
+                None
+            }
+        })
+        .max()
+    {
+        merged.push(RiscVAttribute::PrivilegedSpecRevision(*version));
+    }
+
+    let epilogue = get_epilogue_mut(group_states);
+    epilogue.riscv_attributes = merged;
+
     Ok(())
 }
 
@@ -475,7 +630,7 @@ pub(crate) struct SegmentLayouts {
     /// The layout of each of our segments. Segments containing no active output sections will have
     /// been filtered, so don't try to index this by our internal segment IDs.
     pub(crate) segments: Vec<SegmentLayout>,
-    pub(crate) tls_start_address: Option<u64>,
+    pub(crate) tls_layout: Option<OutputRecordLayout>,
 }
 
 #[derive(Default, Clone)]
@@ -489,7 +644,7 @@ pub(crate) struct SymbolResolutions {
 }
 
 pub(crate) enum FileLayout<'data> {
-    Prelude(PreludeLayout),
+    Prelude(PreludeLayout<'data>),
     Object(ObjectLayout<'data>),
     Dynamic(DynamicLayout<'data>),
     Epilogue(EpilogueLayout<'data>),
@@ -552,7 +707,7 @@ impl SectionResolution {
 }
 
 enum FileLayoutState<'data> {
-    Prelude(PreludeLayoutState),
+    Prelude(PreludeLayoutState<'data>),
     Object(ObjectLayoutState<'data>),
     Dynamic(DynamicLayoutState<'data>),
     NotLoaded(NotLoaded),
@@ -561,27 +716,29 @@ enum FileLayoutState<'data> {
 }
 
 /// Data that doesn't come from any input files, but needs to be written by the linker.
-struct PreludeLayoutState {
+struct PreludeLayoutState<'data> {
     file_id: FileId,
     symbol_id_range: SymbolIdRange,
-    internal_symbols: InternalSymbols,
+    internal_symbols: InternalSymbols<'data>,
     entry_symbol_id: Option<SymbolId>,
     needs_tlsld_got_entry: bool,
     identity: String,
     header_info: Option<HeaderInfo>,
     dynamic_linker: Option<CString>,
     shstrtab_size: u64,
+    eflags: u32,
 }
 
 pub(crate) struct EpilogueLayoutState<'data> {
     file_id: FileId,
     symbol_id_range: SymbolIdRange,
-    internal_symbols: InternalSymbols,
+    internal_symbols: InternalSymbols<'data>,
 
     dynamic_symbol_definitions: Vec<DynamicSymbolDefinition<'data>>,
     gnu_hash_layout: Option<GnuHashLayout>,
     gnu_property_notes: Vec<GnuProperty>,
     build_id_size: Option<usize>,
+    riscv_attributes: Vec<RiscVAttribute>,
 
     verdefs: Option<Vec<VersionDef>>,
 }
@@ -590,7 +747,7 @@ pub(crate) struct LinkerScriptLayoutState<'data> {
     file_id: FileId,
     input: InputRef<'data>,
     symbol_id_range: SymbolIdRange,
-    pub(crate) internal_symbols: InternalSymbols,
+    pub(crate) internal_symbols: InternalSymbols<'data>,
 }
 
 #[derive(Default, Debug)]
@@ -602,12 +759,14 @@ pub(crate) struct GnuHashLayout {
 }
 
 pub(crate) struct EpilogueLayout<'data> {
-    pub(crate) internal_symbols: InternalSymbols,
+    pub(crate) internal_symbols: InternalSymbols<'data>,
     pub(crate) gnu_hash_layout: Option<GnuHashLayout>,
     pub(crate) dynamic_symbol_definitions: Vec<DynamicSymbolDefinition<'data>>,
     dynsym_start_index: u32,
     pub(crate) gnu_property_notes: Vec<GnuProperty>,
     pub(crate) verdefs: Option<Vec<VersionDef>>,
+    pub(crate) riscv_attributes: Vec<RiscVAttribute>,
+    pub(crate) riscv_attributes_length: u32,
 }
 
 pub(crate) struct ObjectLayout<'data> {
@@ -620,17 +779,17 @@ pub(crate) struct ObjectLayout<'data> {
     pub(crate) symbol_id_range: SymbolIdRange,
 }
 
-pub(crate) struct PreludeLayout {
+pub(crate) struct PreludeLayout<'data> {
     pub(crate) entry_symbol_id: Option<SymbolId>,
     pub(crate) tlsld_got_entry: Option<NonZeroU64>,
     pub(crate) identity: String,
     pub(crate) header_info: HeaderInfo,
-    pub(crate) internal_symbols: InternalSymbols,
+    pub(crate) internal_symbols: InternalSymbols<'data>,
     pub(crate) dynamic_linker: Option<CString>,
 }
 
-pub(crate) struct InternalSymbols {
-    pub(crate) symbol_definitions: Vec<InternalSymDefInfo>,
+pub(crate) struct InternalSymbols<'data> {
+    pub(crate) symbol_definitions: Vec<InternalSymDefInfo<'data>>,
     pub(crate) start_symbol_id: SymbolId,
 }
 
@@ -718,6 +877,19 @@ trait SymbolRequestHandler<'data>: std::fmt::Display + HandlerData {
                 &mut common.mem_sizes,
                 symbol_db.args.output_kind(),
             );
+
+            if symbol_db.args.got_plt_syms && resolution_flags.get().needs_got() {
+                let name = symbol_db.symbol_name(symbol_id)?;
+                let name_len = name.len() + 4; // "$got" or "$plt" suffix
+
+                let entry_size = size_of::<elf::SymtabEntry>() as u64;
+                common.allocate(part_id::SYMTAB_LOCAL, entry_size);
+                common.allocate(part_id::STRTAB, name_len as u64 + 1);
+                if resolution_flags.get().needs_plt() {
+                    common.allocate(part_id::SYMTAB_LOCAL, entry_size);
+                    common.allocate(part_id::STRTAB, name_len as u64 + 1);
+                }
+            }
         }
         if symbol_db.args.should_output_symbol_versions() {
             let num_dynamic_symbols =
@@ -748,9 +920,26 @@ fn export_dynamic<'data>(
     symbol_db: &SymbolDb<'data>,
 ) -> Result {
     let name = symbol_db.symbol_name(symbol_id)?;
+
+    let version = (symbol_db.version_script.version_count() > 0)
+        .then(|| {
+            // TODO: We already hashed this symbol at some point previously. See if we can avoid
+            // rehashing it here and if that actually saves us time.
+            symbol_db
+                .version_script
+                .version_for_symbol(&UnversionedSymbolName::prehashed(name.bytes()))
+        })
+        .flatten()
+        .unwrap_or(object::elf::VER_NDX_GLOBAL);
+
     common
         .dynamic_symbol_definitions
-        .push(DynamicSymbolDefinition::new(symbol_id, name.bytes()));
+        .push(DynamicSymbolDefinition::new(
+            symbol_id,
+            name.bytes(),
+            version,
+        ));
+
     Ok(())
 }
 
@@ -818,7 +1007,7 @@ fn allocate_resolution(
         mem_sizes.increment(part_id::GOT, elf::GOT_ENTRY_SIZE * 2);
         // For executables, the TLS module ID is known at link time. For shared objects, we
         // need a runtime relocation to fill it in.
-        if !output_kind.is_executable() {
+        if !output_kind.is_executable() || value_flags.is_dynamic() {
             mem_sizes.increment(part_id::RELA_DYN_GENERAL, elf::RELA_ENTRY_SIZE);
         }
         if value_flags.is_interposable() && has_dynamic_symbol {
@@ -915,7 +1104,7 @@ impl<'data> SymbolRequestHandler<'data> for DynamicLayoutState<'data> {
     }
 }
 
-impl HandlerData for PreludeLayoutState {
+impl HandlerData for PreludeLayoutState<'_> {
     fn file_id(&self) -> FileId {
         self.file_id
     }
@@ -925,7 +1114,7 @@ impl HandlerData for PreludeLayoutState {
     }
 }
 
-impl<'data> SymbolRequestHandler<'data> for PreludeLayoutState {
+impl<'data> SymbolRequestHandler<'data> for PreludeLayoutState<'data> {
     fn load_symbol<'scope, A: Arch>(
         &mut self,
         _common: &mut CommonGroupState,
@@ -1036,9 +1225,6 @@ struct CommonGroupState<'data> {
     /// is stored is non-deterministic and is whichever object first requested export of that
     /// symbol. That's OK though because the epilogue will sort all dynamic symbols.
     dynamic_symbol_definitions: Vec<DynamicSymbolDefinition<'data>>,
-
-    /// Indexed by `FrameIndex`.
-    exception_frames: Vec<ExceptionFrame<'data>>,
 }
 
 impl CommonGroupState<'_> {
@@ -1047,7 +1233,6 @@ impl CommonGroupState<'_> {
             mem_sizes: output_sections.new_part_map(),
             section_attributes: output_sections.new_section_map(),
             dynamic_symbol_definitions: Default::default(),
-            exception_frames: Default::default(),
         }
     }
 
@@ -1125,9 +1310,9 @@ impl CommonGroupState<'_> {
     }
 }
 
-fn create_global_address_emitter(
-    symbol_resolution_flags: &[ResolutionFlags],
-) -> GlobalAddressEmitter {
+fn create_global_address_emitter<'state>(
+    symbol_resolution_flags: &'state [ResolutionFlags],
+) -> GlobalAddressEmitter<'state> {
     GlobalAddressEmitter {
         symbol_resolution_flags,
     }
@@ -1151,12 +1336,16 @@ struct ObjectLayoutState<'data> {
     eh_frame_size: u64,
 
     gnu_property_notes: Vec<GnuProperty>,
+    riscv_attributes: Vec<RiscVAttribute>,
+
+    /// Indexed by `FrameIndex`.
+    exception_frames: Vec<ExceptionFrame<'data>>,
 }
 
 #[derive(Default)]
 struct ExceptionFrame<'data> {
     /// The relocations that need to be processed if we load this frame.
-    relocations: &'data [Rela64<LittleEndian>],
+    relocations: DynamicRelocationSequence<'data>,
 
     /// Number of bytes required to store this frame.
     frame_size: u32,
@@ -1169,6 +1358,37 @@ struct ExceptionFrame<'data> {
 pub(crate) struct GnuProperty {
     pub(crate) ptype: u32,
     pub(crate) data: u32,
+}
+
+#[derive(Debug)]
+pub(crate) struct RiscVArch {
+    map: IndexMap<String, (u64, u64)>,
+}
+
+impl RiscVArch {
+    pub(crate) fn to_attribute_string(&self) -> String {
+        self.map
+            .iter()
+            .map(|(arch, (major, minor))| format!("{arch}{major}p{minor}"))
+            .join("_")
+            .clone()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RiscVAttribute {
+    /// Indicates the stack alignment requirement in bytes.
+    StackAlign(u64),
+    /// Indicates the target architecture of this object.
+    Arch(RiscVArch),
+    /// Indicates whether to impose unaligned memory accesses in code generation.
+    UnalignedAccess(bool),
+    /// Indicates the major version of the privileged specification.
+    PrivilegedSpecMajor(u64),
+    /// Indicates the major version of the privileged specification.
+    PrivilegedSpecMinor(u64),
+    /// Indicates the revision version of the privileged specification.
+    PrivilegedSpecRevision(u64),
 }
 
 #[derive(Default)]
@@ -1352,6 +1572,7 @@ pub(crate) struct DynamicSymbolDefinition<'data> {
     pub(crate) symbol_id: SymbolId,
     pub(crate) name: &'data [u8],
     pub(crate) hash: u32,
+    pub(crate) version: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1436,6 +1657,8 @@ struct GraphResources<'data, 'scope> {
     /// section gets referenced. The sections here will only be those that are eligible for having
     /// __start_ / __stop_ symbols. i.e. sections that don't start their names with a ".".
     start_stop_sections: OutputSectionMap<SegQueue<SectionLoadRequest>>,
+
+    input_data: &'scope InputData<'data>,
 }
 
 struct FinaliseLayoutResources<'scope, 'data> {
@@ -1489,7 +1712,7 @@ impl WorkItem {
 }
 
 impl<'data> Layout<'data> {
-    pub(crate) fn prelude(&self) -> &PreludeLayout {
+    pub(crate) fn prelude(&self) -> &PreludeLayout<'data> {
         let Some(FileLayout::Prelude(i)) = self.group_layouts.first().and_then(|g| g.files.first())
         else {
             panic!("Prelude layout not found at expected offset");
@@ -1574,25 +1797,26 @@ impl<'data> Layout<'data> {
 
     pub(crate) fn tls_start_address(&self) -> u64 {
         // If we don't have a TLS segment then the value we return won't really matter.
-        self.segment_layouts.tls_start_address.unwrap_or(0)
+        self.segment_layouts
+            .tls_layout
+            .as_ref()
+            .map_or(0, |seg| seg.mem_offset)
     }
 
     /// Returns the memory address of the end of the TLS segment including any padding required to
     /// make sure that the TCB will be usize-aligned.
     pub(crate) fn tls_end_address(&self) -> u64 {
-        let tbss = self.section_layouts.get(output_section_id::TBSS);
-        let tdata = self.section_layouts.get(output_section_id::TDATA);
-        let tls_end = tbss.mem_offset + tbss.mem_size;
-        let alignment = tbss.alignment.max(tdata.alignment);
-        alignment.align_up(tls_end)
+        self.segment_layouts.tls_layout.as_ref().map_or(0, |seg| {
+            seg.alignment.align_up(seg.mem_offset + seg.mem_size)
+        })
     }
 
     /// Returns the memory address of the start of the TLS segment used by the AArch64.
     pub(crate) fn tls_start_address_aarch64(&self) -> u64 {
-        let tdata = self.section_layouts.get(output_section_id::TDATA);
-        // Two words at TP are reserved by the arch.
-        let tls_start = tdata.mem_offset - 2 * 8;
-        tdata.alignment.align_down(tls_start)
+        self.segment_layouts.tls_layout.as_ref().map_or(0, |seg| {
+            // Two words at TP are reserved by the arch.
+            seg.alignment.align_down(seg.mem_offset - 2 * 8)
+        })
     }
 
     pub(crate) fn layout_data(&self) -> linker_layout::Layout {
@@ -1639,7 +1863,7 @@ impl<'data> Layout<'data> {
         self.symbol_resolution_flags[symbol_id.as_usize()]
     }
 
-    pub(crate) fn file_layout(&self, file_id: FileId) -> &FileLayout {
+    pub(crate) fn file_layout(&self, file_id: FileId) -> &FileLayout<'data> {
         let group_layout = &self.group_layouts[file_id.group()];
         &group_layout.files[file_id.file()]
     }
@@ -1659,7 +1883,7 @@ impl<'data> Layout<'data> {
             > 0
     }
 
-    pub(crate) fn info_inputs(&self) -> InfoInputs {
+    pub(crate) fn info_inputs<'layout>(&'layout self) -> InfoInputs<'layout> {
         InfoInputs {
             section_part_layouts: &self.section_part_layouts,
             non_addressable_counts: &self.non_addressable_counts,
@@ -1810,7 +2034,10 @@ fn compute_segment_layout(
                 let merge_target = output_sections.primary_output_section(section_id);
 
                 // Skip all ignored sections that will not end up in the final file.
-                if output_sections.output_section_indexes[merge_target.as_usize()].is_none() {
+                if section_layout.file_size == 0
+                    && section_layout.mem_size == 0
+                    && output_sections.output_section_indexes[merge_target.as_usize()].is_none()
+                {
                     continue;
                 }
                 let section_flags = output_sections.section_flags(merge_target);
@@ -1863,27 +2090,27 @@ fn compute_segment_layout(
     complete.sort_by_key(|r| r.segment_id);
 
     assert_eq!(complete.len(), program_segments.len());
-    let mut tls_start_address = None;
+    let mut tls_layout = None;
 
     let mut segments: Vec<SegmentLayout> = header_info
         .active_segment_ids
         .iter()
         .map(|&id| {
             let r = &complete[id.as_usize()];
+
+            let sizes = OutputRecordLayout {
+                file_size: r.file_end - r.file_start,
+                mem_size: r.mem_end - r.mem_start,
+                alignment: r.alignment,
+                file_offset: r.file_start,
+                mem_offset: r.mem_start,
+            };
+
             if program_segments.is_tls_segment(id) {
-                tls_start_address = Some(r.mem_start);
+                tls_layout = Some(sizes);
             }
 
-            SegmentLayout {
-                id,
-                sizes: OutputRecordLayout {
-                    file_size: r.file_end - r.file_start,
-                    mem_size: r.mem_end - r.mem_start,
-                    alignment: r.alignment,
-                    file_offset: r.file_start,
-                    mem_offset: r.mem_start,
-                },
-            }
+            SegmentLayout { id, sizes }
         })
         .collect();
 
@@ -1891,7 +2118,7 @@ fn compute_segment_layout(
 
     Ok(SegmentLayouts {
         segments,
-        tls_start_address,
+        tls_layout,
     })
 }
 
@@ -1967,16 +2194,20 @@ impl SectionAttributes {
 #[tracing::instrument(skip_all, name = "Apply non-addressable indexes")]
 fn apply_non_addressable_indexes(
     group_states: &mut [GroupState],
-    args: &Args,
+    symbol_db: &SymbolDb,
 ) -> Result<NonAddressableCounts> {
     let mut indexes = NonAddressableIndexes {
-        // Allocate version indexes starting from after the local and global indexes.
-        gnu_version_r_index: object::elf::VER_NDX_GLOBAL + 1,
+        // Allocate version indexes starting from after the local and global indexes and any
+        // versions defined by a version script.
+        gnu_version_r_index: object::elf::VER_NDX_GLOBAL
+            + 1.max(symbol_db.version_script.version_count()),
     };
+
     let mut counts = NonAddressableCounts {
         verneed_count: 0,
         verdef_count: 0,
     };
+
     for g in group_states.iter_mut() {
         for s in &mut g.files {
             match s {
@@ -1999,7 +2230,7 @@ fn apply_non_addressable_indexes(
     // versym allocations. This is partly to avoid wasting unnecessary space in the output file, but
     // mostly in order match what GNU ld does.
     if (counts.verneed_count == 0 && counts.verdef_count == 0)
-        && args.should_output_symbol_versions()
+        && symbol_db.args.should_output_symbol_versions()
     {
         for g in group_states {
             *g.common.mem_sizes.get_mut(part_id::GNU_VERSION) = 0;
@@ -2048,11 +2279,12 @@ fn find_required_sections<'data, A: Arch>(
     output_sections: &OutputSections<'data>,
     symbol_resolution_flags: &[AtomicResolutionFlags],
     merged_strings: &OutputSectionMap<MergedStringsSection<'data>>,
+    input_data: &InputData<'data>,
 ) -> Result<GcOutputs<'data>> {
     let num_workers = groups_in.len();
     let (worker_slots, groups) = create_worker_slots(groups_in, output_sections, symbol_db);
 
-    let num_threads = symbol_db.args.num_threads.get();
+    let num_threads = symbol_db.args.available_threads.get();
 
     let idle_threads = (num_threads > 1).then(|| ArrayQueue::new(num_threads - 1));
     let resources = GraphResources {
@@ -2070,6 +2302,7 @@ fn find_required_sections<'data, A: Arch>(
         has_static_tls: AtomicBool::new(false),
         uses_tlsld: AtomicBool::new(false),
         start_stop_sections: output_sections.new_section_map(),
+        input_data,
     };
     let resources_ref = &resources;
 
@@ -2289,11 +2522,11 @@ fn set_last_verneed(
             == gnu_version_r_layout.mem_offset + gnu_version_r_layout.mem_size);
     if is_last_verneed {
         for file in files.iter_mut().rev() {
-            if let FileLayout::Dynamic(d) = file {
-                if d.verneed_info.is_some() {
-                    d.is_last_verneed = true;
-                    break;
-                }
+            if let FileLayout::Dynamic(d) = file
+                && d.verneed_info.is_some()
+            {
+                d.is_last_verneed = true;
+                break;
             }
         }
     }
@@ -2563,7 +2796,7 @@ fn compute_file_sizes(
     })
 }
 
-impl std::fmt::Display for PreludeLayoutState {
+impl std::fmt::Display for PreludeLayoutState<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt("<prelude>", f)
     }
@@ -2719,21 +2952,22 @@ impl Section {
 
 #[inline(always)]
 fn process_relocation<A: Arch>(
-    object: &mut ObjectLayoutState,
+    object: &ObjectLayoutState,
     common: &mut CommonGroupState,
-    rel: &Rela64<LittleEndian>,
+    rel: &Crel,
     section: &object::elf::SectionHeader64<LittleEndian>,
     resources: &GraphResources,
     queue: &mut LocalWorkQueue,
+    is_debug_section: bool,
 ) -> Result<RelocationModifier> {
     let args = resources.symbol_db.args;
     let mut next_modifier = RelocationModifier::Normal;
-    if let Some(local_sym_index) = rel.symbol(LittleEndian, false) {
+    if let Some(local_sym_index) = rel.symbol() {
         let symbol_db = resources.symbol_db;
         let symbol_id = symbol_db.definition(object.symbol_id_range.input_to_id(local_sym_index));
         let symbol_value_flags = symbol_db.local_symbol_value_flags(symbol_id);
-        let rel_offset = rel.r_offset.get(LittleEndian);
-        let r_type = rel.r_type(LittleEndian, false);
+        let rel_offset = rel.r_offset;
+        let r_type = rel.r_type;
 
         let rel_info = if let Some(relaxation) = A::Relaxation::new(
             r_type,
@@ -2743,7 +2977,9 @@ fn process_relocation<A: Arch>(
             args.output_kind(),
             SectionFlags::from_header(section),
             true,
-        ) {
+        )
+        .filter(|relaxation| args.relax || relaxation.is_mandatory())
+        {
             next_modifier = relaxation.next_modifier();
             relaxation.rel_info()
         } else {
@@ -2754,7 +2990,7 @@ fn process_relocation<A: Arch>(
         let mut resolution_flags = resolution_flags(rel_info.kind);
 
         if rel_info.kind.is_tls() {
-            if does_relocation_require_static_tls(r_type) {
+            if does_relocation_require_static_tls(rel_info.kind) {
                 resources
                     .has_static_tls
                     .store(true, atomic::Ordering::Relaxed);
@@ -2789,7 +3025,7 @@ fn process_relocation<A: Arch>(
         {
             if section_is_writable {
                 common.allocate(part_id::RELA_DYN_RELATIVE, elf::RELA_ENTRY_SIZE);
-            } else {
+            } else if !is_debug_section {
                 bail!(
                     "Cannot apply relocation {} to read-only section. \
                     Please recompile with -fPIC or link with -no-pie",
@@ -2803,7 +3039,7 @@ fn process_relocation<A: Arch>(
 
         if previous_flags.is_empty() {
             queue.send_symbol_request(symbol_id, resources);
-            if is_symbol_undefined(
+            if should_emit_undefined_error(
                 object.object.symbol(local_sym_index)?,
                 object.file_id,
                 symbol_db.file_id_for_symbol(symbol_id),
@@ -2811,10 +3047,36 @@ fn process_relocation<A: Arch>(
                 args,
             ) {
                 let symbol_name = symbol_db.symbol_name_for_display(symbol_id);
-                resources.report_error(anyhow::anyhow!(
-                    "Undefined symbol {symbol_name}, referenced by {}",
-                    object.input,
-                ));
+                let source_info = crate::dwarf_address_info::get_source_info::<A>(
+                    object.object,
+                    &object.relocations,
+                    section,
+                    rel_offset,
+                )
+                .context("Failed to get source info")?;
+
+                let lto_file = is_undefined_lto(resources, symbol_id);
+
+                if let Some(file) = lto_file {
+                    resources.report_error(error!(
+                        "undefined reference to `{symbol_name}` found in LTO section of {}",
+                        file.canonicalize()
+                            .unwrap_or(PathBuf::new())
+                            .file_name()
+                            .expect("Canonicalized path can't have /.. at end")
+                            .display()
+                    ));
+                } else if args.error_unresolved_symbols {
+                    resources.report_error(error!(
+                        "Undefined symbol {symbol_name}, referenced by {}\n    {}",
+                        source_info, object.input,
+                    ));
+                } else {
+                    crate::error::warning(&format!(
+                        "Undefined symbol {symbol_name}, referenced by {}\n    {}",
+                        source_info, object.input,
+                    ));
+                }
             }
         }
 
@@ -2825,11 +3087,48 @@ fn process_relocation<A: Arch>(
     Ok(next_modifier)
 }
 
+fn is_undefined_lto(resources: &GraphResources, symbol_id: SymbolId) -> Option<PathBuf> {
+    let raw_symbol_name = resources
+        .symbol_db
+        .symbol_name(symbol_id)
+        .unwrap_or_else(|_| panic!("Found symbol display so symbol with id {symbol_id} exists"));
+    resources
+        .symbol_db
+        .groups
+        .iter()
+        .find_map(|group| match group {
+            Group::Objects(data) => data.iter().find_map(|input| {
+                let section_table = input.parsed.object.sections;
+                let file = &input.parsed.object;
+                section_table
+                    .iter()
+                    .filter(|section_header| {
+                        section_table
+                            .section_name(LittleEndian, section_header)
+                            .unwrap_or(&[])
+                            .starts_with(secnames::GNU_LTO_SYMTAB_PREFIX.as_bytes())
+                    })
+                    .find_map(|section_header| {
+                        let lto_contains_undef = file
+                            .section_data_cow(section_header)
+                            .unwrap_or_default()
+                            .split(|datum| *datum == 0)
+                            .any(|symbol| symbol == raw_symbol_name.bytes());
+                        if lto_contains_undef {
+                            return Some(input.parsed.input.file.filename.clone());
+                        }
+                        None
+                    })
+            }),
+            _ => None,
+        })
+}
+
 /// Returns whether the supplied relocation type requires static TLS. If true and we're writing a
 /// shared object, then the STATIC_TLS will be set in the shared object which is a signal to the
 /// runtime loader that the shared object cannot be loaded at runtime (e.g. with dlopen).
-fn does_relocation_require_static_tls(r_type: u32) -> bool {
-    r_type == object::elf::R_X86_64_GOTTPOFF
+fn does_relocation_require_static_tls(rel_kind: RelocationKind) -> bool {
+    resolution_flags(rel_kind) == ResolutionFlags::GOT_TLS_OFFSET
 }
 
 fn resolution_flags(rel_kind: RelocationKind) -> ResolutionFlags {
@@ -2854,17 +3153,25 @@ fn resolution_flags(rel_kind: RelocationKind) -> ResolutionFlags {
             ResolutionFlags::empty()
         }
         RelocationKind::Absolute
+        | RelocationKind::AbsoluteSet
+        | RelocationKind::AbsoluteSetWord6
+        | RelocationKind::AbsoluteAddition
+        | RelocationKind::AbsoluteSubtraction
+        | RelocationKind::AbsoluteSubtractionWord6
         | RelocationKind::Relative
+        | RelocationKind::RelativeRiscVLow12
         | RelocationKind::DtpOff
         | RelocationKind::TpOff
-        | RelocationKind::TpOffAArch64
-        | RelocationKind::SymRelGotBase => ResolutionFlags::DIRECT,
-        RelocationKind::None | RelocationKind::AbsoluteAArch64 => ResolutionFlags::empty(),
+        | RelocationKind::SymRelGotBase
+        | RelocationKind::PairSubtraction => ResolutionFlags::DIRECT,
+        RelocationKind::None | RelocationKind::AbsoluteAArch64 | RelocationKind::Alignment => {
+            ResolutionFlags::empty()
+        }
     }
 }
 
-impl PreludeLayoutState {
-    fn new(input_state: resolution::ResolvedPrelude) -> Self {
+impl<'data> PreludeLayoutState<'data> {
+    fn new(input_state: resolution::ResolvedPrelude<'data>) -> Self {
         Self {
             file_id: PRELUDE_FILE_ID,
             symbol_id_range: SymbolIdRange::prelude(input_state.symbol_definitions.len()),
@@ -2878,6 +3185,7 @@ impl PreludeLayoutState {
             header_info: None,
             dynamic_linker: None,
             shstrtab_size: 0,
+            eflags: 0,
         }
     }
 
@@ -3051,7 +3359,7 @@ impl PreludeLayoutState {
                 }
 
                 // We always emit symbols that the user requested be undefined.
-                let mut should_emit = matches!(def_info, InternalSymDefInfo::ForceUndefined(_));
+                let mut should_emit = def_info.placement == SymbolPlacement::ForceUndefined;
 
                 // Keep the symbol if we're going to write the section, even though the symbol isn't
                 // referenced. It can be useful to have symbols like _GLOBAL_OFFSET_TABLE_ when
@@ -3109,19 +3417,31 @@ impl PreludeLayoutState {
             .iter()
             .zip(self.internal_symbols.symbol_definitions.iter())
             .for_each(|(symbol_state, definition)| {
-                if !symbol_state.is_empty() {
-                    if let Some(section_id) = definition.section_id() {
-                        *keep_sections.get_mut(section_id) = true;
-                    }
+                if !symbol_state.is_empty()
+                    && let Some(section_id) = definition.section_id()
+                {
+                    *keep_sections.get_mut(section_id) = true;
                 }
             });
 
-        // If any secondary sections were marked to be kept, then unmark them and mark the primary instead.
         for i in 0..output_sections.num_sections() {
             let section_id = OutputSectionId::from_usize(i);
+
+            // If any secondary sections were marked to be kept, then unmark them and mark the
+            // primary instead.
             if let Some(primary_id) = output_sections.merge_target(section_id) {
                 let keep_secondary = replace(keep_sections.get_mut(section_id), false);
                 *keep_sections.get_mut(primary_id) |= keep_secondary;
+            }
+
+            // Remove any sections without a type except for section 0 (the file header). This
+            // should just be the .phdr and .shdr sections which contain the program headers and
+            // section headers. We need these sections in order to allocate space for those
+            // structures, but other linkers don't emit section headers for them, so neither should
+            // we.
+            let section_info = output_sections.section_infos.get(section_id);
+            if section_info.ty == sht::NULL && section_id != output_section_id::FILE_HEADER {
+                *keep_sections.get_mut(section_id) = false;
             }
         }
 
@@ -3131,22 +3451,25 @@ impl PreludeLayoutState {
         let mut next_output_index = 0;
         let mut output_section_indexes = vec![None; output_sections.num_sections()];
         for event in output_order {
-            if let OrderEvent::Section(id) = event {
-                if *keep_sections.get(id) {
-                    debug_assert!(
-                        output_sections.merge_target(id).is_none(),
-                        "Tried to allocate section header for secondary section {}",
-                        output_sections.section_debug(id)
-                    );
-                    output_section_indexes[id.as_usize()] = Some(next_output_index);
-                    next_output_index += 1;
-                }
+            if let OrderEvent::Section(id) = event
+                && *keep_sections.get(id)
+            {
+                debug_assert!(
+                    output_sections.merge_target(id).is_none(),
+                    "Tried to allocate section header for secondary section {}",
+                    output_sections.section_debug(id)
+                );
+                output_section_indexes[id.as_usize()] = Some(next_output_index);
+                next_output_index += 1;
             };
         }
         output_sections.output_section_indexes = output_section_indexes;
 
         // Determine which program segments contain sections that we're keeping.
-        let mut keep_segments = vec![false; program_segments.len()];
+        let mut keep_segments = program_segments
+            .iter()
+            .map(|details| details.always_keep())
+            .collect_vec();
         let mut active_segments = Vec::with_capacity(4);
         for event in output_order {
             match event {
@@ -3163,6 +3486,9 @@ impl PreludeLayoutState {
                 OrderEvent::SetLocation(_) => {}
             }
         }
+
+        // Always keep the program headers segment even though we don't emit any sections in it.
+        keep_segments[0] = true;
 
         // If relro is disabled, then discard the relro segment.
         if !symbol_db.args.relro {
@@ -3184,6 +3510,7 @@ impl PreludeLayoutState {
                 .expect("output section count must fit in a u16"),
 
             active_segment_ids,
+            eflags: self.eflags,
         };
 
         // Allocate space for headers based on segment and section counts.
@@ -3211,7 +3538,7 @@ impl PreludeLayoutState {
         memory_offsets: &mut OutputSectionPartMap<u64>,
         resolutions_out: &mut ResolutionWriter,
         resources: &FinaliseLayoutResources<'_, '_>,
-    ) -> Result<PreludeLayout> {
+    ) -> Result<PreludeLayout<'data>> {
         let header_layout = resources
             .section_layouts
             .get(output_section_id::FILE_HEADER);
@@ -3258,7 +3585,7 @@ impl PreludeLayoutState {
     }
 }
 
-impl InternalSymbols {
+impl<'data> InternalSymbols<'data> {
     fn allocate_symbol_table_sizes(
         &self,
         sizes: &mut OutputSectionPartMap<u64>,
@@ -3327,13 +3654,13 @@ fn create_start_end_symbol_resolution(
         return None;
     }
 
-    let raw_value = match def_info {
-        InternalSymDefInfo::Undefined | InternalSymDefInfo::ForceUndefined(_) => 0,
-        InternalSymDefInfo::SectionStart(section_id) => {
+    let raw_value = match def_info.placement {
+        SymbolPlacement::Undefined | SymbolPlacement::ForceUndefined => 0,
+        SymbolPlacement::SectionStart(section_id) => {
             resources.section_layouts.get(section_id).mem_offset
         }
 
-        InternalSymDefInfo::SectionEnd(section_id) => {
+        SymbolPlacement::SectionEnd(section_id) => {
             let sec = resources.section_layouts.get(section_id);
             sec.mem_offset + sec.mem_size
         }
@@ -3348,7 +3675,7 @@ fn create_start_end_symbol_resolution(
     ))
 }
 
-fn is_symbol_undefined(
+fn should_emit_undefined_error(
     symbol: &Symbol,
     sym_file_id: FileId,
     sym_def_file_id: FileId,
@@ -3359,9 +3686,15 @@ fn is_symbol_undefined(
         return false;
     }
 
-    sym_file_id == sym_def_file_id
+    let is_symbol_undefined = sym_file_id == sym_def_file_id
         && symbol.is_undefined(LittleEndian)
-        && symbol_value_flags.is_absolute()
+        && symbol_value_flags.is_absolute();
+
+    match args.unresolved_symbols {
+        crate::args::UnresolvedSymbols::IgnoreAll
+        | crate::args::UnresolvedSymbols::IgnoreInObjectFiles => false,
+        _ => is_symbol_undefined,
+    }
 }
 
 impl<'data> EpilogueLayoutState<'data> {
@@ -3374,7 +3707,7 @@ impl<'data> EpilogueLayoutState<'data> {
         };
     }
 
-    fn new(input_state: ResolvedEpilogue) -> EpilogueLayoutState<'data> {
+    fn new(input_state: ResolvedEpilogue<'data>) -> EpilogueLayoutState<'data> {
         EpilogueLayoutState {
             file_id: input_state.file_id,
             symbol_id_range: SymbolIdRange::epilogue(
@@ -3390,6 +3723,7 @@ impl<'data> EpilogueLayoutState<'data> {
             gnu_property_notes: Default::default(),
             build_id_size: Default::default(),
             verdefs: Default::default(),
+            riscv_attributes: Default::default(),
         }
     }
 
@@ -3401,6 +3735,50 @@ impl<'data> EpilogueLayoutState<'data> {
                 + GNU_NOTE_NAME.len()
                 + self.gnu_property_notes.len() * GNU_NOTE_PROPERTY_ENTRY_SIZE) as u64
         }
+    }
+
+    fn riscv_attributes_section_size(&self) -> u64 {
+        let size_of_uleb_encoded = |value| {
+            let mut cursor = Cursor::new([0u8; 10]);
+            leb128::write::unsigned(&mut cursor, value).unwrap()
+        };
+
+        (if self.riscv_attributes.is_empty() {
+            0
+        } else {
+            1 // 'A'
+            + 4 // sizeof(u32)
+            + size_of_uleb_encoded(TAG_RISCV_WHOLE_FILE)
+            + 4 // sizeof(u32)
+            + RISCV_ATTRIBUTE_VENDOR_NAME.len() + 1
+            + self.riscv_attributes.iter().map(|attr| {
+                match attr {
+                    RiscVAttribute::StackAlign(align) => {
+                                        size_of_uleb_encoded(TAG_RISCV_STACK_ALIGN) +
+                                        size_of_uleb_encoded(*align)
+                                    }
+                    RiscVAttribute::Arch(arch) => {
+                                        size_of_uleb_encoded(TAG_RISCV_ARCH)
+                                        +arch.to_attribute_string().len() + 1
+                                    }
+                    RiscVAttribute::UnalignedAccess(_) => {
+                                        size_of_uleb_encoded(TAG_RISCV_UNALIGNED_ACCESS) + 1
+                                    }
+                    RiscVAttribute::PrivilegedSpecMajor(version) => {
+                                        size_of_uleb_encoded(TAG_RISCV_PRIV_SPEC) +
+                                        size_of_uleb_encoded(*version)
+                    },
+                    RiscVAttribute::PrivilegedSpecMinor(version) => {
+                                        size_of_uleb_encoded(TAG_RISCV_PRIV_SPEC_MINOR) +
+                                        size_of_uleb_encoded(*version)
+                    }
+                    RiscVAttribute::PrivilegedSpecRevision(version) => {
+                                        size_of_uleb_encoded(TAG_RISCV_PRIV_SPEC_REVISION) +
+                                        size_of_uleb_encoded(*version)
+                    }
+                                    }
+            }).sum::<usize>()
+        }) as u64
     }
 
     fn gnu_build_id_note_section_size(&self) -> Option<u64> {
@@ -3460,6 +3838,10 @@ impl<'data> EpilogueLayoutState<'data> {
             part_id::NOTE_GNU_PROPERTY,
             self.gnu_property_notes_section_size(),
         );
+        common.allocate(
+            part_id::RISCV_ATTRIBUTES,
+            self.riscv_attributes_section_size(),
+        );
 
         if let Some(build_id_sec_size) = self.gnu_build_id_note_section_size() {
             common.allocate(part_id::NOTE_GNU_BUILD_ID, build_id_sec_size);
@@ -3493,7 +3875,7 @@ impl<'data> EpilogueLayoutState<'data> {
             // Take all but the base version
             for version in symbol_db.version_script.version_iter().skip(1) {
                 verdefs.push(VersionDef {
-                    name: version.name.as_bytes().to_vec(),
+                    name: version.name.to_vec(),
                     parent_index: version.parent_index,
                 });
                 common.allocate(part_id::DYNSTR, version.name.len() as u64 + 1);
@@ -3573,6 +3955,10 @@ impl<'data> EpilogueLayoutState<'data> {
             part_id::NOTE_GNU_PROPERTY,
             self.gnu_property_notes_section_size(),
         );
+        memory_offsets.increment(
+            part_id::RISCV_ATTRIBUTES,
+            self.riscv_attributes_section_size(),
+        );
 
         if let Some(build_id_sec_size) = self.gnu_build_id_note_section_size() {
             memory_offsets.increment(part_id::NOTE_GNU_BUILD_ID, build_id_sec_size);
@@ -3589,6 +3975,7 @@ impl<'data> EpilogueLayoutState<'data> {
             );
         }
 
+        let riscv_attributes_length = self.riscv_attributes_section_size() as u32;
         Ok(EpilogueLayout {
             internal_symbols: self.internal_symbols,
             gnu_hash_layout: self.gnu_hash_layout,
@@ -3596,6 +3983,8 @@ impl<'data> EpilogueLayoutState<'data> {
             dynsym_start_index,
             gnu_property_notes: self.gnu_property_notes,
             verdefs: self.verdefs,
+            riscv_attributes: self.riscv_attributes,
+            riscv_attributes_length,
         })
     }
 }
@@ -3603,6 +3992,7 @@ impl<'data> EpilogueLayoutState<'data> {
 pub(crate) struct HeaderInfo {
     pub(crate) num_output_sections_with_content: u16,
     pub(crate) active_segment_ids: Vec<ProgramSegmentId>,
+    pub(crate) eflags: u32,
 }
 
 impl HeaderInfo {
@@ -3634,6 +4024,8 @@ fn new_object_layout_state(input_state: resolution::ResolvedObject) -> FileLayou
             relocations: non_dynamic.relocations,
             cies: Default::default(),
             gnu_property_notes: Default::default(),
+            riscv_attributes: Default::default(),
+            exception_frames: Default::default(),
         })
     } else {
         FileLayoutState::Dynamic(DynamicLayoutState {
@@ -3664,6 +4056,7 @@ impl<'data> ObjectLayoutState<'data> {
     ) -> Result {
         let mut eh_frame_section = None;
         let mut note_gnu_property_section = None;
+        let mut riscv_attributes_section = None;
 
         let no_gc = !resources.symbol_db.args.gc_sections;
 
@@ -3703,6 +4096,9 @@ impl<'data> ObjectLayoutState<'data> {
                 SectionSlot::NoteGnuProperty(index) => {
                     note_gnu_property_section = Some(*index);
                 }
+                SectionSlot::RiscvVAttributes(index) => {
+                    riscv_attributes_section = Some(*index);
+                }
                 _ => (),
             }
         }
@@ -3722,9 +4118,23 @@ impl<'data> ObjectLayoutState<'data> {
         if let Some(note_gnu_property_index) = note_gnu_property_section {
             process_gnu_property_note(self, note_gnu_property_index)?;
         }
+        if let Some(riscv_attributes_index) = riscv_attributes_section {
+            ensure!(
+                A::elf_header_arch_magic() == object::elf::EM_RISCV,
+                ".riscv.attribute section is supported only for riscv64 target"
+            );
+            process_riscv_attributes(self, riscv_attributes_index)
+                .context("Cannot parse .riscv.attributes section")?;
+        }
 
-        if resources.symbol_db.args.output_kind() == OutputKind::SharedObject {
-            self.load_non_hidden_symbols::<A>(common, resources, queue)?;
+        let export_all_dynamic = resources.symbol_db.args.output_kind() == OutputKind::SharedObject
+            && (!resources.symbol_db.args.exclude_libs || !self.input.has_archive_semantics())
+            || resources.symbol_db.args.needs_dynsym()
+                && resources.symbol_db.args.export_all_dynamic_symbols;
+        if export_all_dynamic
+            || resources.symbol_db.args.needs_dynsym() && resources.symbol_db.export_list.is_some()
+        {
+            self.load_non_hidden_symbols::<A>(common, resources, queue, export_all_dynamic)?;
         }
 
         Ok(())
@@ -3742,7 +4152,8 @@ impl<'data> ObjectLayoutState<'data> {
                 self.load_section::<A>(common, queue, *unloaded, section_index, resources)?;
             }
             SectionSlot::UnloadedDebugInfo(part_id) => {
-                self.load_debug_section(common, *part_id, section_index)?;
+                // On RISC-V, the debug info sections contain relocations to local symbols (e.g. labels).
+                self.load_debug_section::<A>(common, queue, *part_id, section_index, resources)?;
             }
             SectionSlot::Discard => {
                 bail!(
@@ -3753,7 +4164,8 @@ impl<'data> ObjectLayoutState<'data> {
             SectionSlot::Loaded(_)
             | SectionSlot::EhFrameData(..)
             | SectionSlot::LoadedDebugInfo(..)
-            | SectionSlot::NoteGnuProperty(..) => {}
+            | SectionSlot::NoteGnuProperty(..)
+            | SectionSlot::RiscvVAttributes(..) => {}
             SectionSlot::MergeStrings(sec) => {
                 // We currently always load everything in merge-string sections. i.e. we don't GC
                 // unreferenced data. So the only thing we need to do here is propagate section
@@ -3777,27 +4189,26 @@ impl<'data> ObjectLayoutState<'data> {
         let part_id = unloaded.part_id;
         let header = self.object.section(section_index)?;
         let section = Section::create(header, self, section_index, part_id)?;
-        let mut modifier = RelocationModifier::Normal;
 
-        for rel in self.relocations(section.index)? {
-            if modifier == RelocationModifier::SkipNextRelocation {
-                modifier = RelocationModifier::Normal;
-                continue;
+        match self.relocations(section.index)? {
+            RelocationList::Rela(relocations) => {
+                self.load_section_relocations::<A>(
+                    common,
+                    queue,
+                    resources,
+                    section,
+                    relocations.crel_iter(),
+                )?;
             }
-            modifier = process_relocation::<A>(
-                self,
-                common,
-                rel,
-                self.object.section(section.index)?,
-                resources,
-                queue,
-            )
-            .with_context(|| {
-                format!(
-                    "Failed to copy section `{}` from file {self}",
-                    section_debug(self.object, section.index)
-                )
-            })?;
+            RelocationList::Crel(relocations) => {
+                self.load_section_relocations::<A>(
+                    common,
+                    queue,
+                    resources,
+                    section,
+                    relocations.flat_map(|r| r.ok()),
+                )?;
+            }
         }
 
         tracing::debug!(loaded_section = %self.object.section_display_name(section_index),);
@@ -3809,14 +4220,50 @@ impl<'data> ObjectLayoutState<'data> {
             .get(part_id.output_section_id())
             .fetch_or(true, atomic::Ordering::Relaxed);
 
-        self.process_section_exception_frames::<A>(
-            unloaded.last_frame_index,
-            common,
-            resources,
-            queue,
-        )?;
+        if section.size > 0 {
+            self.process_section_exception_frames::<A>(
+                unloaded.last_frame_index,
+                common,
+                resources,
+                queue,
+            )?;
+        }
 
         self.sections[section_index.0] = SectionSlot::Loaded(section);
+
+        Ok(())
+    }
+
+    fn load_section_relocations<A: Arch>(
+        &self,
+        common: &mut CommonGroupState<'data>,
+        queue: &mut LocalWorkQueue,
+        resources: &GraphResources<'data, '_>,
+        section: Section,
+        relocations: impl Iterator<Item = Crel>,
+    ) -> Result {
+        let mut modifier = RelocationModifier::Normal;
+        for rel in relocations {
+            if modifier == RelocationModifier::SkipNextRelocation {
+                modifier = RelocationModifier::Normal;
+                continue;
+            }
+            modifier = process_relocation::<A>(
+                self,
+                common,
+                &rel,
+                self.object.section(section.index)?,
+                resources,
+                queue,
+                false,
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to copy section {} from file {self}",
+                    section_debug(self.object, section.index)
+                )
+            })?;
+        }
 
         Ok(())
     }
@@ -3832,20 +4279,43 @@ impl<'data> ObjectLayoutState<'data> {
         let mut num_frames = 0;
         let mut next_frame_index = frame_index;
         while let Some(frame_index) = next_frame_index {
-            let frame_data = &common.exception_frames[frame_index.as_usize()];
+            let frame_data = &self.exception_frames[frame_index.as_usize()];
             next_frame_index = frame_data.previous_frame_for_section;
 
             self.eh_frame_size += u64::from(frame_data.frame_size);
 
             num_frames += 1;
 
-            let frame_data_relocations = frame_data.relocations;
-
             // Request loading of any sections/symbols referenced by the FDEs for our
             // section.
             if let Some(eh_frame_section) = self.eh_frame_section {
-                for rel in frame_data_relocations {
-                    process_relocation::<A>(self, common, rel, eh_frame_section, resources, queue)?;
+                match &frame_data.relocations {
+                    DynamicRelocationSequence::Rela(frame_data_relocations) => {
+                        for rel in *frame_data_relocations {
+                            process_relocation::<A>(
+                                self,
+                                common,
+                                &Crel::from_rela(rel, LittleEndian, false),
+                                eh_frame_section,
+                                resources,
+                                queue,
+                                false,
+                            )?;
+                        }
+                    }
+                    DynamicRelocationSequence::Crel(frame_data_relocations) => {
+                        for rel in frame_data_relocations.crel_iter() {
+                            process_relocation::<A>(
+                                self,
+                                common,
+                                &rel,
+                                eh_frame_section,
+                                resources,
+                                queue,
+                                false,
+                            )?;
+                        }
+                    }
                 }
             }
         }
@@ -3860,17 +4330,72 @@ impl<'data> ObjectLayoutState<'data> {
         Ok(())
     }
 
-    fn load_debug_section(
+    fn load_debug_section<A: Arch>(
         &mut self,
         common: &mut CommonGroupState<'data>,
+        queue: &mut LocalWorkQueue,
+
         part_id: PartId,
         section_index: SectionIndex,
+        resources: &GraphResources<'data, '_>,
     ) -> Result {
         let header = self.object.section(section_index)?;
         let section = Section::create(header, self, section_index, part_id)?;
+        if A::local_symbols_in_debug_info() {
+            match self.relocations(section.index)? {
+                RelocationList::Rela(relocations) => self.load_debug_relocations::<A>(
+                    common,
+                    queue,
+                    resources,
+                    section,
+                    relocations.crel_iter(),
+                )?,
+                RelocationList::Crel(relocations) => self.load_debug_relocations::<A>(
+                    common,
+                    queue,
+                    resources,
+                    section,
+                    relocations.flat_map(|r| r.ok()),
+                )?,
+            }
+        }
+
         tracing::debug!(loaded_debug_section = %self.object.section_display_name(section_index),);
         common.section_loaded(part_id, header, section);
         self.sections[section_index.0] = SectionSlot::LoadedDebugInfo(section);
+
+        Ok(())
+    }
+
+    fn load_debug_relocations<A: Arch>(
+        &self,
+        common: &mut CommonGroupState<'data>,
+        queue: &mut LocalWorkQueue,
+        resources: &GraphResources<'data, '_>,
+        section: Section,
+        relocations: impl Iterator<Item = Crel>,
+    ) -> Result<(), Error> {
+        for rel in relocations {
+            let modifier = process_relocation::<A>(
+                self,
+                common,
+                &rel,
+                self.object.section(section.index)?,
+                resources,
+                queue,
+                true,
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to copy section {} from file {self}",
+                    section_debug(self.object, section.index)
+                )
+            })?;
+            ensure!(
+                modifier == RelocationModifier::Normal,
+                "All debug relocations must be processed"
+            );
+        }
 
         Ok(())
     }
@@ -4131,11 +4656,12 @@ impl<'data> ObjectLayoutState<'data> {
         common: &mut CommonGroupState<'data>,
         resources: &GraphResources<'data, 'scope>,
         queue: &mut LocalWorkQueue,
+        export_all_dynamic: bool,
     ) -> Result {
         for (sym_index, sym) in self.object.symbols.enumerate() {
             let symbol_id = self.symbol_id_range().input_to_id(sym_index);
 
-            if !can_export_symbol(sym, symbol_id, resources.symbol_db) {
+            if !can_export_symbol(sym, symbol_id, resources.symbol_db, export_all_dynamic) {
                 continue;
             }
 
@@ -4169,7 +4695,7 @@ impl<'data> ObjectLayoutState<'data> {
         // regular object, then the shared object might send us a request to export the definition
         // provided by the regular object. This isn't always possible, since the symbol might be
         // hidden.
-        if !can_export_symbol(sym, symbol_id, resources.symbol_db) {
+        if !can_export_symbol(sym, symbol_id, resources.symbol_db, true) {
             return Ok(());
         }
 
@@ -4187,7 +4713,7 @@ impl<'data> ObjectLayoutState<'data> {
         Ok(())
     }
 
-    fn relocations(&self, index: SectionIndex) -> Result<&'data [elf::Rela]> {
+    fn relocations(&self, index: SectionIndex) -> Result<RelocationList<'data>> {
         self.object.relocations(index, &self.relocations)
     }
 }
@@ -4215,11 +4741,11 @@ impl<'data> SymbolCopyInfo<'data> {
             return None;
         }
 
-        if let Ok(Some(section)) = object.symbol_section(sym, sym_index) {
-            if !sections[section.0].is_loaded() {
-                // Symbol is in a discarded section.
-                return None;
-            }
+        if let Ok(Some(section)) = object.symbol_section(sym, sym_index)
+            && !sections[section.0].is_loaded()
+        {
+            // Symbol is in a discarded section.
+            return None;
         }
 
         if sym.is_common(e) && symbol_state.is_empty() {
@@ -4246,6 +4772,7 @@ fn can_export_symbol(
     sym: &crate::elf::SymtabEntry,
     symbol_id: SymbolId,
     symbol_db: &SymbolDb,
+    export_all_dynamic: bool,
 ) -> bool {
     if sym.is_undefined(LittleEndian) || sym.is_local() {
         return false;
@@ -4267,6 +4794,14 @@ fn can_export_symbol(
         return false;
     }
 
+    if !export_all_dynamic
+        && let Some(export_list) = &symbol_db.export_list
+        && let Ok(symbol_name) = symbol_db.symbol_name(symbol_id)
+        && !&export_list.contains(&UnversionedSymbolName::prehashed(symbol_name.bytes()))
+    {
+        return false;
+    }
+
     true
 }
 
@@ -4280,10 +4815,43 @@ fn process_eh_frame_data<'data, A: Arch>(
 ) -> Result {
     let eh_frame_section = object.object.section(eh_frame_section_index)?;
     let data = object.object.raw_section_data(eh_frame_section)?;
+    match object.relocations(eh_frame_section_index)? {
+        RelocationList::Rela(relocations) => process_eh_frame_relocations::<A>(
+            object,
+            common,
+            file_symbol_id_range,
+            resources,
+            queue,
+            eh_frame_section,
+            data,
+            &relocations,
+        ),
+        RelocationList::Crel(crel_iterator) => process_eh_frame_relocations::<A>(
+            object,
+            common,
+            file_symbol_id_range,
+            resources,
+            queue,
+            eh_frame_section,
+            data,
+            &crel_iterator.collect::<Result<Vec<Crel>, _>>()?,
+        ),
+    }
+}
+
+fn process_eh_frame_relocations<'data, 'rel: 'data, A: Arch>(
+    object: &mut ObjectLayoutState<'data>,
+    common: &mut CommonGroupState<'data>,
+    file_symbol_id_range: SymbolIdRange,
+    resources: &GraphResources<'_, '_>,
+    queue: &mut LocalWorkQueue,
+    eh_frame_section: &'data object::elf::SectionHeader64<LittleEndian>,
+    data: &'data [u8],
+    relocations: &impl RelocationSequence<'rel>,
+) -> Result {
     const PREFIX_LEN: usize = size_of::<elf::EhFrameEntryPrefix>();
-    let e = LittleEndian;
-    let relocations = object.relocations(eh_frame_section_index)?;
-    let mut rel_iter = relocations.iter().enumerate().peekable();
+
+    let mut rel_iter = relocations.crel_iter().enumerate().peekable();
     let mut offset = 0;
 
     while offset + PREFIX_LEN <= data.len() {
@@ -4295,9 +4863,11 @@ fn process_eh_frame_data<'data, A: Arch>(
             bytemuck::pod_read_unaligned(&data[offset..offset + PREFIX_LEN]);
         let size = size_of_val(&prefix.length) + prefix.length as usize;
         let next_offset = offset + size;
+
         if next_offset > data.len() {
             bail!("Invalid .eh_frame data");
         }
+
         if prefix.cie_id == 0 {
             // This is a CIE
             let mut referenced_symbols: SmallVec<[SymbolId; 1]> = Default::default();
@@ -4306,15 +4876,25 @@ fn process_eh_frame_data<'data, A: Arch>(
             // because we're not taking that into consideration, we disallow deduplication.
             let mut eligible_for_deduplication = true;
             while let Some((_, rel)) = rel_iter.peek() {
-                let rel_offset = rel.r_offset.get(e);
+                let rel_offset = rel.r_offset;
                 if rel_offset >= next_offset as u64 {
                     // This relocation belongs to the next entry.
                     break;
                 }
+
                 // We currently always load all CIEs, so any relocations found in CIEs always need
                 // to be processed.
-                process_relocation::<A>(object, common, rel, eh_frame_section, resources, queue)?;
-                if let Some(local_sym_index) = rel.symbol(e, false) {
+                process_relocation::<A>(
+                    object,
+                    common,
+                    rel,
+                    eh_frame_section,
+                    resources,
+                    queue,
+                    false,
+                )?;
+
+                if let Some(local_sym_index) = rel.symbol() {
                     let local_symbol_id = file_symbol_id_range.input_to_id(local_sym_index);
                     let definition = resources.symbol_db.definition(local_symbol_id);
                     referenced_symbols.push(definition);
@@ -4323,6 +4903,7 @@ fn process_eh_frame_data<'data, A: Arch>(
                 }
                 rel_iter.next();
             }
+
             object.cies.push(CieAtOffset {
                 offset: offset as u32,
                 cie: Cie {
@@ -4338,15 +4919,13 @@ fn process_eh_frame_data<'data, A: Arch>(
             let mut rel_end_index = 0;
 
             while let Some((rel_index, rel)) = rel_iter.peek() {
-                let rel_offset = rel.r_offset.get(e);
+                let rel_offset = rel.r_offset;
                 if rel_offset < next_offset as u64 {
                     let is_pc_begin = (rel_offset as usize - offset) == elf::FDE_PC_BEGIN_OFFSET;
 
-                    if is_pc_begin {
-                        if let Some(index) = rel.symbol(e, false) {
-                            let elf_symbol = object.object.symbol(index)?;
-                            section_index = object.object.symbol_section(elf_symbol, index)?;
-                        }
+                    if is_pc_begin && let Some(index) = rel.symbol() {
+                        let elf_symbol = object.object.symbol(index)?;
+                        section_index = object.object.symbol_section(elf_symbol, index)?;
                     }
                     rel_end_index = rel_index + 1;
                     rel_iter.next();
@@ -4355,20 +4934,20 @@ fn process_eh_frame_data<'data, A: Arch>(
                 }
             }
 
-            if let Some(section_index) = section_index {
-                if let Some(unloaded) = object.sections[section_index.0].unloaded_mut() {
-                    let frame_index = FrameIndex::from_usize(common.exception_frames.len());
+            if let Some(section_index) = section_index
+                && let Some(unloaded) = object.sections[section_index.0].unloaded_mut()
+            {
+                let frame_index = FrameIndex::from_usize(object.exception_frames.len());
 
-                    // Update our unloaded section to point to our new frame. Our frame will then in
-                    // turn point to whatever the section pointed to before.
-                    let previous_frame_for_section = unloaded.last_frame_index.replace(frame_index);
+                // Update our unloaded section to point to our new frame. Our frame will then in
+                // turn point to whatever the section pointed to before.
+                let previous_frame_for_section = unloaded.last_frame_index.replace(frame_index);
 
-                    common.exception_frames.push(ExceptionFrame {
-                        relocations: &relocations[rel_start_index..rel_end_index],
-                        frame_size: size as u32,
-                        previous_frame_for_section,
-                    });
-                }
+                object.exception_frames.push(ExceptionFrame {
+                    relocations: relocations.subsequence(rel_start_index..rel_end_index),
+                    frame_size: size as u32,
+                    previous_frame_for_section,
+                });
             }
         }
         offset = next_offset;
@@ -4394,7 +4973,7 @@ fn process_gnu_property_note(
     for note in notes {
         for gnu_property in note?
             .gnu_properties(e)
-            .ok_or(anyhow!("Invalid type of .note.gnu.property"))?
+            .ok_or(error!("Invalid type of .note.gnu.property"))?
         {
             let gnu_property = gnu_property?;
 
@@ -4411,6 +4990,115 @@ fn process_gnu_property_note(
             });
         }
     }
+
+    Ok(())
+}
+
+fn process_riscv_attributes(
+    object: &mut ObjectLayoutState,
+    riscv_attributes_section_index: object::SectionIndex,
+) -> Result {
+    let section = object.object.section(riscv_attributes_section_index)?;
+    let e = LittleEndian;
+
+    let content = section.data(e, object.object.data)?;
+    ensure!(content.starts_with(b"A"), "Header must start with 'A'");
+    let mut content = &content[1..];
+
+    let read_uleb128 = |content: &mut &[u8]| leb128::read::unsigned(content);
+    let read_string = |content: &mut &[u8]| -> Result<String> {
+        let string = CStr::from_bytes_until_nul(content)?;
+        *content = &content[string.count_bytes() + 1..];
+        Ok(string.to_string_lossy().to_string())
+    };
+    let read_u32 = |content: &mut &[u8]| -> Result<u32> {
+        let value = u32::from_le_bytes(content[..4].try_into()?);
+        *content = &content[4..];
+        Ok(value)
+    };
+
+    // Expect only one subsection
+    let _size = read_u32(&mut content)?;
+    let vendor = read_string(&mut content).context("Cannot read vendor string")?;
+    ensure!(
+        vendor == RISCV_ATTRIBUTE_VENDOR_NAME,
+        "Unsupported vendor ('{vendor:?}') subsection"
+    );
+
+    // Assume only one sub-sub-section
+    let tag = read_uleb128(&mut content).context("Cannot read tag of subsection")?;
+    ensure!(tag == TAG_RISCV_WHOLE_FILE, "Whole file tag expected");
+    let _size = read_u32(&mut content)?;
+    let mut attributes = Vec::new();
+
+    while !content.is_empty() {
+        let tag = read_uleb128(&mut content).context("Cannot read tag of sub-subsection")?;
+        let attribute = match tag {
+            TAG_RISCV_STACK_ALIGN => {
+                let align = read_uleb128(&mut content).context("Cannot read stack alignment")?;
+                RiscVAttribute::StackAlign(align)
+            }
+            TAG_RISCV_ARCH => {
+                let arch = read_string(&mut content).context("Cannot read arch attributes")?;
+                let components = arch
+                    .split('_')
+                    .map(|part| {
+                        let mut it = part.chars().rev();
+                        let minor = it
+                            .next()
+                            .ok_or_else(|| crate::error!("Cannot parse minor"))?
+                            .to_string();
+                        let p = it
+                            .next()
+                            .ok_or_else(|| crate::error!("Cannot parse 'p' separator"))?;
+                        ensure!(p == 'p', "Separator expected");
+                        let major = it
+                            .next()
+                            .ok_or_else(|| crate::error!("Cannot parse major"))?
+                            .to_string();
+                        let name = String::from_iter(it.rev());
+                        Ok((name, (major.parse()?, minor.parse()?)))
+                    })
+                    .collect::<Result<IndexMap<_, _>>>()?;
+
+                RiscVAttribute::Arch(RiscVArch { map: components })
+            }
+            TAG_RISCV_UNALIGNED_ACCESS => {
+                let access = read_uleb128(&mut content).context("Cannot read unaligned access")?;
+                RiscVAttribute::UnalignedAccess(access > 0)
+            }
+            TAG_RISCV_PRIV_SPEC => {
+                let version =
+                    read_uleb128(&mut content).context("Cannot read privileged major version")?;
+                RiscVAttribute::PrivilegedSpecMajor(version)
+            }
+            TAG_RISCV_PRIV_SPEC_MINOR => {
+                let version =
+                    read_uleb128(&mut content).context("Cannot read privileged minor version")?;
+                RiscVAttribute::PrivilegedSpecMinor(version)
+            }
+            TAG_RISCV_PRIV_SPEC_REVISION => {
+                let version = read_uleb128(&mut content)
+                    .context("Cannot read privileged revision version")?;
+                RiscVAttribute::PrivilegedSpecRevision(version)
+            }
+            TAG_RISCV_ATOMIC_ABI => {
+                let _abi = read_uleb128(&mut content).context("Cannot read atomic ABI")?;
+                bail!("TAG_RISCV_ATOMIC_ABI is not supported yet");
+            }
+            TAG_RISCV_X3_REG_USAGE => {
+                let _x3 = read_uleb128(&mut content).context("Cannot read x3 register usage")?;
+                bail!("TAG_RISCV_X3_REG_USAGE is not supported yet");
+            }
+            _ => {
+                bail!("Unsupported tag: {tag}");
+            }
+        };
+        attributes.push(attribute);
+    }
+
+    object.riscv_attributes = attributes;
+    ensure!(content.is_empty(), "Unexpected multiple sub-sections");
 
     Ok(())
 }
@@ -4624,8 +5312,8 @@ impl Resolution {
         // For most symbols, `raw_value` won't be zero, so we can save ourselves from looking up the
         // section to see if it's a string-merge section. For string-merge symbols with names,
         // `raw_value` will have already been computed, so we can avoid computing it again.
-        if self.raw_value == 0 {
-            if let Some(r) = get_merged_string_output_address(
+        if self.raw_value == 0
+            && let Some(r) = get_merged_string_output_address(
                 symbol_index,
                 addend,
                 object_layout.object,
@@ -4633,12 +5321,12 @@ impl Resolution {
                 merged_strings,
                 merged_string_start_addresses,
                 false,
-            )? {
-                if self.raw_value != 0 {
-                    bail!("Merged string resolution has value 0x{}", self.raw_value);
-                }
-                return Ok(r);
+            )?
+        {
+            if self.raw_value != 0 {
+                bail!("Merged string resolution has value 0x{}", self.raw_value);
             }
+            return Ok(r);
         }
         Ok(self.raw_value.wrapping_add(addend as u64))
     }
@@ -4755,9 +5443,9 @@ impl<'data> DynamicLayoutState<'data> {
         resources: &GraphResources<'data, '_>,
         queue: &mut LocalWorkQueue,
     ) -> Result {
-        let dt_info = DynamicTagValues::read(self.object)?;
-        self.symbol_versions_needed = vec![false; dt_info.verdefnum as usize];
+        self.symbol_versions_needed = vec![false; self.object.verdefnum as usize];
 
+        let dt_info = DynamicTagValues::read(self.object)?;
         if let Some(soname) = dt_info.soname {
             self.lib_name = soname;
         }
@@ -4769,30 +5457,76 @@ impl<'data> DynamicLayoutState<'data> {
 
         common.allocate(part_id::DYNSTR, self.lib_name.len() as u64 + 1);
 
-        self.request_all_undefined_symbols(resources, queue);
-
-        Ok(())
+        self.request_all_undefined_symbols(resources, queue)
     }
 
     fn request_all_undefined_symbols(
         &self,
         resources: &GraphResources<'data, '_>,
         queue: &mut LocalWorkQueue,
-    ) {
+    ) -> Result {
+        let mut check_undefined_cache = None;
+
         for symbol_id in self.symbol_id_range() {
-            if resources.symbol_db.is_canonical(symbol_id) {
-                continue;
-            }
-
             let definition_symbol_id = resources.symbol_db.definition(symbol_id);
-            let file_id = resources.symbol_db.file_id_for_symbol(definition_symbol_id);
 
-            queue.send_work(
-                resources,
-                file_id,
-                WorkItem::ExportDynamic(definition_symbol_id),
-            );
+            let value_flags = resources
+                .symbol_db
+                .local_symbol_value_flags(definition_symbol_id);
+
+            if value_flags.is_dynamic() && value_flags.is_absolute() {
+                // Our shared object references an undefined symbol. Whether that is an error or
+                // not, depends on flags, whether the symbol is weak and whether all of the shared
+                // object's dependencies are loaded.
+
+                let args = resources.symbol_db.args;
+                let check_undefined = *check_undefined_cache.get_or_insert_with(|| {
+                    !args.allow_shlib_undefined
+                        && args.output_kind().is_executable()
+                        // Like lld, our behaviour for --no-allow-shlib-undefined is to only report
+                        // errors for shared objects that have all their dependencies in the link.
+                        // This is in contrast to GNU ld which recursively loads all transitive
+                        // dependencies of shared objects and checks our shared object against
+                        // those.
+                        && self.has_complete_deps(resources)
+                });
+
+                if check_undefined {
+                    let symbol = self
+                        .object
+                        .symbol(self.symbol_id_range.id_to_input(symbol_id))?;
+                    if !symbol.is_weak() {
+                        let should_report = !matches!(
+                            args.unresolved_symbols,
+                            crate::args::UnresolvedSymbols::IgnoreAll
+                                | crate::args::UnresolvedSymbols::IgnoreInSharedLibs
+                        );
+
+                        if should_report {
+                            let symbol_name =
+                                resources.symbol_db.symbol_name_for_display(symbol_id);
+
+                            if args.error_unresolved_symbols {
+                                bail!("undefined reference to `{symbol_name}` from {self}");
+                            }
+                            crate::error::warning(&format!(
+                                "undefined reference to `{symbol_name}` from {self}"
+                            ));
+                        }
+                    }
+                }
+            } else if definition_symbol_id != symbol_id {
+                let file_id = resources.symbol_db.file_id_for_symbol(definition_symbol_id);
+
+                queue.send_work(
+                    resources,
+                    file_id,
+                    WorkItem::ExportDynamic(definition_symbol_id),
+                );
+            }
         }
+
+        Ok(())
     }
 
     fn finalise_copy_relocations(
@@ -4825,22 +5559,36 @@ impl<'data> DynamicLayoutState<'data> {
             let mut base_size = 0;
             while let Some((verdef, mut aux_iterator)) = verdef_iterator.next()? {
                 let version_index = verdef.vd_ndx.get(e);
+
                 if version_index == 0 {
                     bail!("Invalid version index");
                 }
+
                 let flags = verdef.vd_flags.get(e);
                 let is_base = (flags & object::elf::VER_FLG_BASE) != 0;
+
                 // Keep the base version and any versions that are referenced.
                 let needed = is_base
                     || *self
                         .symbol_versions_needed
                         .get(usize::from(version_index - 1))
                         .context("Invalid version index")?;
+
                 if needed {
-                    // Every VERDEF entry should have at least one AUX entry.
-                    let aux = aux_iterator.next()?.context("VERDEF with no AUX entry")?;
-                    let name = aux.name(e, strings)?;
+                    // For the base version, we use the lib_name rather than the version name from
+                    // the input file. This matches what GNU ld appears to do. Also, if we don't do
+                    // this, then the C runtime hits an assertion failure, because it expects to be
+                    // able to find a DT_NEEDED entry that matches the base name of a version.
+                    let name = if is_base {
+                        self.lib_name
+                    } else {
+                        // Every VERDEF entry should have at least one AUX entry.
+                        let aux = aux_iterator.next()?.context("VERDEF with no AUX entry")?;
+                        aux.name(e, strings)?
+                    };
+
                     let name_size = name.len() as u64 + 1;
+
                     if is_base {
                         // The base version doesn't count as a version, so we don't increment
                         // version_count here. We emit it as a Verneed, whereas the actual versions
@@ -4941,14 +5689,14 @@ impl<'data> DynamicLayoutState<'data> {
         counts: &mut NonAddressableCounts,
     ) -> Result {
         self.non_addressable_indexes = *indexes;
-        if let Some(info) = self.verneed_info.as_ref() {
-            if info.version_count > 0 {
-                counts.verneed_count += 1;
-                indexes.gnu_version_r_index = indexes
-                    .gnu_version_r_index
-                    .checked_add(info.version_count)
-                    .context("Symbol versions overflowed 2**16")?;
-            }
+        if let Some(info) = self.verneed_info.as_ref()
+            && info.version_count > 0
+        {
+            counts.verneed_count += 1;
+            indexes.gnu_version_r_index = indexes
+                .gnu_version_r_index
+                .checked_add(info.version_count)
+                .context("Symbol versions overflowed 2**16")?;
         }
         Ok(())
     }
@@ -5076,7 +5824,7 @@ impl<'data> DynamicLayoutState<'data> {
                 is_weak: symbol.is_weak(),
             });
 
-        info.add_symbol(symbol_id, symbol.is_weak(), resources.symbol_db)?;
+        info.add_symbol(symbol_id, symbol.is_weak(), resources.symbol_db);
 
         Ok(())
     }
@@ -5101,6 +5849,32 @@ impl<'data> DynamicLayoutState<'data> {
                 Ok((input_address, output_address))
             })
             .try_collect()
+    }
+
+    /// Return whether all DT_NEEDED entries for this shared object correspond to input files that
+    /// we have loaded.
+    fn has_complete_deps(&self, resources: &GraphResources) -> bool {
+        let Ok(dynamic_tags) = self.object.dynamic_tags() else {
+            return true;
+        };
+
+        let e = LittleEndian;
+        for entry in dynamic_tags {
+            let value = entry.d_val(e);
+            match entry.d_tag(e) as u32 {
+                object::elf::DT_NEEDED => {
+                    let Ok(name) = self.object.symbols.strings().get(value as u32) else {
+                        return false;
+                    };
+                    if !resources.input_data.has_file(name) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        true
     }
 }
 
@@ -5166,23 +5940,21 @@ impl<'data> LinkerScriptLayoutState<'data> {
 }
 
 impl CopyRelocationInfo {
-    fn add_symbol(&mut self, symbol_id: SymbolId, is_weak: bool, symbol_db: &SymbolDb) -> Result {
+    fn add_symbol(&mut self, symbol_id: SymbolId, is_weak: bool, symbol_db: &SymbolDb) {
         if self.symbol_id == symbol_id || is_weak {
-            return Ok(());
+            return;
         }
 
         if !self.is_weak {
-            bail!(
+            warning(&format!(
                 "Multiple non-weak symbols at the same address have copy relocations: {}, {}",
                 symbol_db.symbol_debug(self.symbol_id),
                 symbol_db.symbol_debug(symbol_id)
-            );
+            ));
         }
 
         self.symbol_id = symbol_id;
         self.is_weak = false;
-
-        Ok(())
     }
 }
 
@@ -5225,7 +5997,7 @@ impl<'data> DynamicTagValues<'data> {
                         file.symbols
                             .strings()
                             .get(value as u32)
-                            .map_err(|()| anyhow!("Invalid DT_SONAME 0x{value:x}"))?,
+                            .map_err(|()| error!("Invalid DT_SONAME 0x{value:x}"))?,
                     );
                 }
                 _ => {}
@@ -5298,11 +6070,12 @@ impl GnuHashLayout {
 }
 
 impl<'data> DynamicSymbolDefinition<'data> {
-    fn new(symbol_id: SymbolId, name: &'data [u8]) -> Self {
+    fn new(symbol_id: SymbolId, name: &'data [u8], version: u16) -> Self {
         Self {
             symbol_id,
             name,
             hash: gnu_hash(name),
+            version,
         }
     }
 }
@@ -5328,7 +6101,7 @@ fn needs_tlsld(relocation_kind: RelocationKind) -> bool {
 }
 
 impl<'data> ObjectLayout<'data> {
-    pub(crate) fn relocations(&self, index: SectionIndex) -> Result<&'data [elf::Rela]> {
+    pub(crate) fn relocations(&self, index: SectionIndex) -> Result<RelocationList<'data>> {
         self.object.relocations(index, &self.relocations)
     }
 }
@@ -5396,6 +6169,7 @@ fn test_no_disallowed_overlaps() {
         active_segment_ids: (0..program_segments.len())
             .map(ProgramSegmentId::new)
             .collect(),
+        eflags: 0,
     };
 
     let mut section_index = 0;
@@ -5447,6 +6221,18 @@ fn test_no_disallowed_overlaps() {
 impl Display for ResolutionFlags {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         bitflags::parser::to_writer(self, f)
+    }
+}
+
+pub(crate) struct ResFlagsDisplay<'a>(pub(crate) &'a Resolution);
+
+impl Display for ResFlagsDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "value_flags = {} resolution_flags = {}",
+            self.0.value_flags, self.0.resolution_flags
+        )
     }
 }
 

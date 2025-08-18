@@ -14,55 +14,68 @@
 
 use crate::alignment::Alignment;
 use crate::arch::Architecture;
+use crate::bail;
+use crate::ensure;
+use crate::error::Context as _;
 use crate::error::Result;
 use crate::input_data::FileId;
 use crate::linker_script::maybe_forced_sysroot;
 use crate::save_dir::SaveDir;
-use anyhow::Context as _;
-use anyhow::bail;
-use anyhow::ensure;
+use jobserver::Acquired;
+use jobserver::Client;
 use rayon::ThreadPoolBuilder;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI64;
+use std::sync::atomic::Ordering;
 
 pub struct Args {
+    pub(crate) unrecognized_options: Vec<String>,
+
     pub(crate) arch: Architecture,
     pub(crate) lib_search_path: Vec<Box<Path>>,
     pub(crate) inputs: Vec<Input>,
     pub(crate) output: Arc<Path>,
     pub(crate) dynamic_linker: Option<Box<Path>>,
-    pub(crate) num_threads: NonZeroUsize,
+    pub num_threads: Option<NonZeroUsize>,
     pub(crate) strip_all: bool,
     pub(crate) strip_debug: bool,
     pub(crate) prepopulate_maps: bool,
     pub(crate) sym_info: Option<String>,
     pub(crate) merge_strings: bool,
     pub(crate) debug_fuel: Option<AtomicI64>,
-    pub(crate) time_phases: bool,
     pub(crate) validate_output: bool,
     pub(crate) version_script_path: Option<PathBuf>,
     pub(crate) debug_address: Option<u64>,
     pub(crate) write_layout: bool,
     pub(crate) should_write_eh_frame_hdr: bool,
     pub(crate) write_trace: bool,
+    pub(crate) wrap: Vec<String>,
     pub(crate) rpath: Option<String>,
     pub(crate) soname: Option<String>,
     pub(crate) files_per_group: Option<u32>,
+    pub(crate) exclude_libs: bool,
     pub(crate) gc_sections: bool,
     pub(crate) should_fork: bool,
     pub(crate) build_id: BuildIdOption,
     pub(crate) file_write_mode: Option<FileWriteMode>,
     pub(crate) no_undefined: bool,
+    pub(crate) allow_shlib_undefined: bool,
     pub(crate) needs_origin_handling: bool,
+    pub(crate) needs_nodelete_handling: bool,
     pub(crate) allow_copy_relocations: bool,
     pub(crate) sysroot: Option<Box<Path>>,
     pub(crate) undefined: Vec<String>,
     pub(crate) relro: bool,
     pub(crate) entry: Option<String>,
+    pub(crate) export_all_dynamic_symbols: bool,
+    pub(crate) export_list: Vec<String>,
+    pub(crate) export_list_path: Option<PathBuf>,
 
     /// If set, GC stats will be written to the specified filename.
     pub(crate) write_gc_stats: Option<PathBuf>,
@@ -71,17 +84,54 @@ pub struct Args {
     /// specified substrings.
     pub(crate) gc_stats_ignore: Vec<String>,
 
+    /// If `Some`, then we'll time how long each phase takes. We'll also measure the specified
+    /// counters, if any.
+    pub(crate) time_phase_options: Option<Vec<CounterKind>>,
+
     pub(crate) verbose_gc_stats: bool,
 
+    pub(crate) save_dir: SaveDir,
     pub(crate) print_allocations: Option<FileId>,
     pub(crate) execstack: bool,
     pub(crate) verify_allocation_consistency: bool,
     pub(crate) should_print_version: bool,
     pub(crate) demangle: bool,
+    pub(crate) got_plt_syms: bool,
+    pub(crate) b_symbolic: BSymbolicKind,
+    pub(crate) relax: bool,
+    pub(crate) unresolved_symbols: UnresolvedSymbols,
+    pub(crate) error_unresolved_symbols: bool,
+    pub(crate) allow_multiple_definitions: bool,
+    pub(crate) z_interpose: bool,
 
     output_kind: Option<OutputKind>,
-    is_dynamic_executable: bool,
+    pub(crate) is_dynamic_executable: AtomicBool,
     relocation_model: RelocationModel,
+
+    /// The number of actually available threads (considering jobserver)
+    pub(crate) available_threads: NonZeroUsize,
+
+    jobserver_client: Option<Client>,
+}
+
+#[derive(Clone, Copy)]
+pub enum CounterKind {
+    Cycles,
+    Instructions,
+    CacheMisses,
+    BranchMisses,
+    PageFaults,
+    PageFaultsMinor,
+    PageFaultsMajor,
+    L1dRead,
+    L1dMiss,
+}
+
+/// Represents a command-line argument that specifies the number of threads to use,
+/// triggering activation of the thread pool.
+pub struct ActivatedArgs {
+    pub args: Args,
+    _jobserver_tokens: Vec<Acquired>,
 }
 
 #[derive(Debug)]
@@ -118,7 +168,7 @@ pub(crate) enum FileWriteMode {
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
-pub(crate) struct Modifiers {
+pub struct Modifiers {
     /// Whether shared objects should only be linked if they're referenced.
     pub(crate) as_needed: bool,
 
@@ -148,6 +198,30 @@ pub(crate) enum InputSpec {
     Lib(Box<str>),
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum BSymbolicKind {
+    None,
+    All,
+    Functions,
+    NonWeakFunctions,
+    NonWeak,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum UnresolvedSymbols {
+    /// Report all unresolved symbols.
+    ReportAll,
+
+    /// Ignore unresolved symbols in shared libraries.
+    IgnoreInSharedLibs,
+
+    /// Ignore unresolved symbols in object files.
+    IgnoreInObjectFiles,
+
+    /// Ignore all unresolved symbols.
+    IgnoreAll,
+}
+
 pub const WILD_UNSUPPORTED_ENV: &str = "WILD_UNSUPPORTED";
 pub const VALIDATE_ENV: &str = "WILD_VALIDATE_OUTPUT";
 pub const WRITE_LAYOUT_ENV: &str = "WILD_WRITE_LAYOUT";
@@ -170,62 +244,53 @@ const SILENTLY_IGNORED_FLAGS: &[&str] = &[
     // Just like other modern linkers, we don't need groups in order to resolve cycles.
     "start-group",
     "end-group",
-    "(",
-    ")",
     // TODO: This is supposed to suppress built-in search paths, but I don't think we have any
     // built-in search paths. Perhaps we should?
     "nostdlib",
     // TODO
     "no-undefined-version",
-    "export-dynamic",
     "fatal-warnings",
     "color-diagnostics",
     "undefined-version",
     "sort-common",
-    "no-relax",
+    "stats",
 ];
+const SILENTLY_IGNORED_SHORT_FLAGS: &[&str] = &["(", ")"];
 
 const IGNORED_FLAGS: &[&str] = &[
     "gdb-index",
     "disable-new-dtags",
     "fix-cortex-a53-835769",
     "fix-cortex-a53-843419",
-    "no-export-dynamic",
-    "Bsymbolic",
-    "Bsymbolic-functions",
-    "Bsymbolic-non-weak-functions", // LLD specific
-    "Bsymbolic-non-weak",           // LLD specific
 ];
 
 // These flags map to the default behavior of the linker.
 const DEFAULT_FLAGS: &[&str] = &[
     "no-call-graph-profile-sort",
-    "relax",
     "no-copy-dt-needed-entries",
     "no-add-needed",
     "discard-locals",
-    "X",  // alias for --discard-locals
-    "EL", // little endian
     "enable-new-dtags",
 ];
-
-pub(crate) fn available_parallelism() -> std::num::NonZeroUsize {
-    std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::new(1).unwrap())
-}
+const DEFAULT_SHORT_FLAGS: &[&str] = &[
+    "X",  // alias for --discard-locals
+    "EL", // little endian
+];
 
 impl Default for Args {
     fn default() -> Self {
         Args {
             arch: default_target_arch(),
+            unrecognized_options: Vec::new(),
 
             lib_search_path: Vec::new(),
             inputs: Vec::new(),
             output: Arc::from(Path::new("a.out")),
-            is_dynamic_executable: false,
+            is_dynamic_executable: AtomicBool::new(false),
             dynamic_linker: None,
             output_kind: None,
-            time_phases: false,
-            num_threads: available_parallelism(),
+            time_phase_options: None,
+            num_threads: None,
             strip_all: false,
             strip_debug: false,
             // For now, we default to --gc-sections. This is different to other linkers, but other than
@@ -253,6 +318,7 @@ impl Default for Args {
             debug_address: None,
             should_write_eh_frame_hdr: false,
             write_gc_stats: None,
+            wrap: Vec::new(),
             gc_stats_ignore: Vec::new(),
             verbose_gc_stats: false,
             rpath: None,
@@ -260,33 +326,65 @@ impl Default for Args {
             execstack: false,
             should_fork: true,
             needs_origin_handling: false,
+            needs_nodelete_handling: false,
             file_write_mode: None,
             build_id: BuildIdOption::None,
             files_per_group: None,
+            exclude_libs: false,
             no_undefined: false,
+            allow_shlib_undefined: false,
             should_print_version: false,
             sysroot: None,
+            save_dir: Default::default(),
             demangle: true,
             undefined: Vec::new(),
             relro: true,
             entry: None,
+            b_symbolic: BSymbolicKind::None,
+            export_all_dynamic_symbols: false,
+            export_list: Vec::new(),
+            export_list_path: None,
+            got_plt_syms: false,
+            relax: true,
+            jobserver_client: None,
+            available_threads: NonZeroUsize::new(1).unwrap(),
+            unresolved_symbols: UnresolvedSymbols::ReportAll,
+            error_unresolved_symbols: true,
+            allow_multiple_definitions: false,
+            z_interpose: false,
         }
     }
 }
 
 // Parse the supplied input arguments, which should not include the program name.
-pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(mut input: I) -> Result<Args> {
+pub(crate) fn parse<F: Fn() -> I, S: AsRef<str>, I: Iterator<Item = S>>(input: F) -> Result<Args> {
+    use crate::input_data::MAX_FILES_PER_GROUP;
+
+    // SAFETY: Should be called early before other descriptors are opened and
+    // so we open it before the arguments are parsed (can open a file).
+    let jobserver_client = unsafe { Client::from_env() };
+
+    let files_per_group = std::env::var(FILES_PER_GROUP_ENV)
+        .ok()
+        .map(|s| s.parse())
+        .transpose()?;
+
+    if let Some(x) = files_per_group {
+        ensure!(
+            x <= MAX_FILES_PER_GROUP,
+            "{FILES_PER_GROUP_ENV}={x} but maximum is {MAX_FILES_PER_GROUP}"
+        );
+    }
+
     let mut args = Args {
-        files_per_group: std::env::var(FILES_PER_GROUP_ENV)
-            .ok()
-            .map(|s| s.parse())
-            .transpose()?,
+        files_per_group,
+        jobserver_client,
         ..Default::default()
     };
 
-    let mut unrecognised = Vec::new();
+    args.save_dir = SaveDir::new(&input)?;
 
-    let mut save_dir = SaveDir::new()?;
+    let mut input = input();
 
     let mut modifier_stack = vec![Modifiers::default()];
 
@@ -294,320 +392,25 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(mut input: I) -> Resul
         args.write_layout = true;
         args.write_trace = true;
     }
+
+    let arg_parser = setup_argument_parser();
     let mut arg_num = 0;
     while let Some(arg) = input.next() {
-        arg_num += 1;
         let arg = arg.as_ref();
 
-        fn strip_option(arg: &str) -> Option<&str> {
-            arg.strip_prefix("--").or(arg.strip_prefix('-'))
-        }
-        let long_arg_eq = |option: &str| {
-            assert!(
-                !option.starts_with('-'),
-                "option cannot start with a dash: `{option}`"
-            );
-            strip_option(arg) == Some(option)
-        };
-        let long_arg_split_prefix = |option: &str| -> Option<&str> {
-            assert!(!option.starts_with('-'));
-            assert!(option.ends_with('='));
-            strip_option(arg).and_then(|stripped_arg| stripped_arg.strip_prefix(option))
-        };
-        let mut handle_z_option = |arg: &str| -> Result {
-            match arg {
-                "now" => {}
-                "origin" => args.needs_origin_handling = true,
-                "relro" => args.relro = true,
-                "norelro" => args.relro = false,
-                "notext" => {}
-                "nostart-stop-gc" => {}
-                "execstack" => args.execstack = true,
-                "noexecstack" => args.execstack = false,
-                "nocopyreloc" => args.allow_copy_relocations = false,
-                _ => {
-                    warn_unsupported(&format!("-z {arg}"))?;
-                    // TODO: Handle these
-                }
-            }
-            Ok(())
-        };
-
-        if let Some(rest) = arg.strip_prefix("-L") {
-            let handle_sysroot = |path| {
-                args.sysroot
-                    .as_ref()
-                    .and_then(|sysroot| maybe_forced_sysroot(path, sysroot))
-                    .unwrap_or_else(|| Box::from(path))
-            };
-            if rest.is_empty() {
-                if let Some(next) = input.next() {
-                    args.lib_search_path
-                        .push(handle_sysroot(Path::new(next.as_ref())));
-                }
-            } else {
-                args.lib_search_path.push(handle_sysroot(Path::new(rest)));
-            }
-        } else if let Some(rest) = arg.strip_prefix("-l") {
-            let spec = if let Some(stripped) = rest.strip_prefix(':') {
-                InputSpec::File(Box::from(Path::new(stripped)))
-            } else {
-                InputSpec::Lib(Box::from(rest))
-            };
-            args.inputs.push(Input {
-                spec,
-                search_first: None,
-                modifiers: *modifier_stack.last().unwrap(),
-            });
-        } else if long_arg_eq("static") || long_arg_eq("Bstatic") {
-            modifier_stack.last_mut().unwrap().allow_shared = false;
-        } else if long_arg_eq("Bdynamic") {
-            modifier_stack.last_mut().unwrap().allow_shared = true;
-        } else if arg == "-o" {
-            args.output = input
-                .next()
-                .map(|a| Arc::from(Path::new(a.as_ref())))
-                .context("Missing argument to -o")?;
-        } else if long_arg_eq("dynamic-linker") {
-            args.is_dynamic_executable = true;
-            args.dynamic_linker = input.next().map(|a| Box::from(Path::new(a.as_ref())));
-        } else if let Some(rest) = long_arg_split_prefix("dynamic-linker=") {
-            args.is_dynamic_executable = true;
-            args.dynamic_linker = Some(Box::from(Path::new(rest)));
-        } else if long_arg_eq("no-dynamic-linker") {
-            args.dynamic_linker = None;
-        } else if let Some(style) = long_arg_split_prefix("hash-style=") {
-            // We don't technically support both hash styles, but if requested to do both, we just
-            // do GNU, which we do support.
-            if style != "gnu" && style != "both" {
-                bail!("Unsupported hash-style `{style}`");
-            }
-            // Since we currently only support GNU hash, there's no state to update.
-        } else if let Some(rest) = long_arg_split_prefix("entry=") {
-            args.entry = Some(rest.to_owned());
-        } else if long_arg_eq("build-id") {
-            args.build_id = BuildIdOption::Fast;
-        } else if let Some(build_id_value) = long_arg_split_prefix("build-id=") {
-            args.build_id = match build_id_value {
-                "none" => BuildIdOption::None,
-                "fast" | "md5" | "sha1" => BuildIdOption::Fast,
-                "uuid" => BuildIdOption::Uuid,
-                s if s.starts_with("0x") || s.starts_with("0X") => {
-                    let hex_string = &s[2..];
-                    let decoded_bytes = hex::decode(hex_string)
-                        .with_context(|| format!("Invalid Hex Build Id `0x{hex_string}`"))?;
-                    BuildIdOption::Hex(decoded_bytes)
-                }
-                s => bail!(
-                    "Invalid build-id value `{s}` valid values are `none`, `fast`, `md5`, `sha1` and `uuid`"
-                ),
-            };
-        } else if let Some(value) = long_arg_split_prefix("icf=") {
-            match value {
-                "none" => {}
-                other => warn_unsupported(&format!("--icf={other}"))?,
-            }
-        } else if long_arg_eq("time") {
-            args.time_phases = true;
-        } else if let Some(rest) = long_arg_split_prefix("threads=") {
-            args.num_threads = NonZeroUsize::try_from(rest.parse::<usize>()?)?;
-        } else if long_arg_eq("threads") {
-            // Default behaviour (multiple threads)
-            args.num_threads = available_parallelism();
-        } else if let Some(rest) = long_arg_split_prefix("thread-count=") {
-            args.num_threads = NonZeroUsize::try_from(rest.parse::<usize>()?)?;
-        } else if long_arg_eq("no-threads") {
-            args.num_threads = NonZeroUsize::new(1).unwrap();
-        } else if long_arg_eq("strip-all") || arg == "-s" {
-            args.strip_all = true;
-            args.strip_debug = true;
-        } else if long_arg_eq("strip-debug") || arg == "-S" {
-            args.strip_debug = true;
-        } else if long_arg_eq("gc-sections") {
-            args.gc_sections = true;
-        } else if long_arg_eq("no-gc-sections") {
-            args.gc_sections = false;
-        } else if long_arg_eq("no-fork") {
-            args.should_fork = false;
-        } else if long_arg_eq("update-in-place") {
-            args.file_write_mode = Some(FileWriteMode::UpdateInPlace);
-        } else if arg == "-m" {
-            let arg_value = input.next().context("Missing argument to -m")?;
-            let arg_value = arg_value.as_ref();
-            args.arch = Architecture::from_str(arg_value)?;
-        } else if let Some(arg_value) = arg.strip_prefix("-m") {
-            args.arch = Architecture::from_str(arg_value)?;
-        } else if long_arg_eq("EB") {
-            bail!("Big-endian target is not supported");
-        } else if arg == "-z" {
-            handle_z_option(input.next().context("Missing argument to -z")?.as_ref())?;
-        } else if let Some(arg) = arg.strip_prefix("-z") {
-            handle_z_option(arg)?;
-        } else if let Some(_rest) = arg.strip_prefix("-O") {
-            // We don't use opt-level for now.
-        } else if long_arg_eq("prepopulate-maps") {
-            args.prepopulate_maps = true;
-        } else if long_arg_eq("sym-info") {
-            args.sym_info = input.next().map(|a| a.as_ref().to_owned());
-        } else if long_arg_eq("as-needed") {
-            modifier_stack.last_mut().unwrap().as_needed = true;
-        } else if long_arg_eq("no-as-needed") {
-            modifier_stack.last_mut().unwrap().as_needed = false;
-        } else if long_arg_eq("whole-archive") {
-            modifier_stack.last_mut().unwrap().whole_archive = true;
-        } else if long_arg_eq("no-whole-archive") {
-            modifier_stack.last_mut().unwrap().whole_archive = false;
-        } else if long_arg_eq("start-lib") {
-            modifier_stack.last_mut().unwrap().archive_semantics = true;
-        } else if long_arg_eq("end-lib") {
-            modifier_stack.last_mut().unwrap().archive_semantics = false;
-        } else if long_arg_eq("push-state") {
-            modifier_stack.push(*modifier_stack.last().unwrap());
-        } else if long_arg_eq("pop-state") {
-            modifier_stack.pop();
-            // We put the initial value on the stack, so if it's ever empty, then the arguments
-            // are invalid.
-            if modifier_stack.is_empty() {
-                bail!("Mismatched --pop-state");
-            }
-        } else if long_arg_eq("version-script") {
-            let script = input
-                .next()
-                .context("Missing argument to -version-script")?
-                .as_ref()
-                .to_owned();
-            save_dir.handle_file(&script)?;
-            args.version_script_path = Some(PathBuf::from(script));
-        } else if let Some(script) = long_arg_split_prefix("script=") {
-            save_dir.handle_file(script)?;
-            args.add_script(script);
-        } else if arg == "-T" {
-            let script = input.next().context("Missing argument to -T")?;
-            save_dir.handle_file(script.as_ref())?;
-            args.add_script(script.as_ref());
-        } else if let Some(script) = long_arg_split_prefix("version-script=") {
-            save_dir.handle_file(script)?;
-            args.version_script_path = Some(PathBuf::from(script));
-        } else if long_arg_eq("rpath") {
-            let value = input.next().context("Missing argument to -rpath")?;
-            append_rpath(&mut args.rpath, value.as_ref());
-        } else if let Some(rest) = long_arg_split_prefix("rpath=") {
-            append_rpath(&mut args.rpath, rest);
-        } else if long_arg_eq("no-string-merge") {
-            args.merge_strings = false;
-        } else if long_arg_eq("pie") {
-            args.relocation_model = RelocationModel::Relocatable;
-        } else if long_arg_eq("no-pie") {
-            args.relocation_model = RelocationModel::NonRelocatable;
-        } else if long_arg_eq("eh-frame-hdr") {
-            args.should_write_eh_frame_hdr = true;
-        } else if long_arg_eq("shared") {
-            args.output_kind = Some(OutputKind::SharedObject);
-        } else if let Some(rest) = long_arg_split_prefix("soname=") {
-            args.soname = Some(rest.to_owned());
-        } else if long_arg_eq("soname") {
-            args.soname = Some(
-                input
-                    .next()
-                    .context("Missing argument to -soname")?
-                    .as_ref()
-                    .to_owned(),
-            );
-        } else if long_arg_split_prefix("plugin-opt=").is_some() {
-            // TODO: Implement support for linker plugins.
-        } else if long_arg_eq("plugin") {
-            let other = input
-                .next()
-                .context("Missing argument to --plugin")?
-                .as_ref()
-                .to_owned();
-            warn_unsupported(&format!("--plugin {other}"))?;
-        } else if let Some(rest) = long_arg_split_prefix("dependency-file=") {
-            warn_unsupported(&format!("--dependency-file={rest}"))?;
-        } else if long_arg_eq("rpath-link") {
-            // TODO
-            input.next();
-        } else if long_arg_eq("validate-output") {
-            args.validate_output = true;
-        } else if long_arg_eq("write-layout") {
-            args.write_layout = true;
-        } else if long_arg_eq("write-trace") {
-            args.write_trace = true;
-        } else if let Some(rest) = long_arg_split_prefix("write-gc-stats=") {
-            args.write_gc_stats = Some(PathBuf::from(rest));
-        } else if let Some(rest) = long_arg_split_prefix("gc-stats-ignore=") {
-            args.gc_stats_ignore.push(rest.to_owned());
-        } else if long_arg_eq("version") || arg == "-v" {
-            args.should_print_version = true;
-        } else if long_arg_eq("verbose-gc-stats") {
-            args.verbose_gc_stats = true;
-        } else if let Some(rest) = long_arg_split_prefix("debug-address=") {
-            args.debug_address = Some(parse_number(rest).context("Invalid --debug-address")?);
-        } else if let Some(rest) = long_arg_split_prefix("debug-fuel=") {
-            args.debug_fuel = Some(AtomicI64::new(rest.parse()?));
-            // Using debug fuel with more than one thread would likely give non-deterministic
-            // results.
-            args.num_threads = NonZeroUsize::new(1).unwrap();
-        } else if long_arg_eq("no-undefined") {
-            args.no_undefined = true;
-        } else if let Some(rest) = long_arg_split_prefix("undefined=") {
-            args.undefined.push(rest.to_owned());
-        } else if let Some(rest) = arg.strip_prefix("-u") {
-            if rest.is_empty() {
-                args.undefined.push(
-                    input
-                        .next()
-                        .context("Missing argument to -u")?
-                        .as_ref()
-                        .to_owned(),
-                );
-            } else {
-                args.undefined.push(rest.to_owned());
-            }
-        } else if long_arg_eq("demangle") {
-            args.demangle = true;
-        } else if long_arg_eq("no-demangle") {
-            args.demangle = false;
-        } else if let Some(path) = arg.strip_prefix('@') {
+        // Handle `@file`
+        // TODO: This is ad-hoc.
+        if let Some(path) = arg.strip_prefix('@') {
             if input.next().is_some() || arg_num > 1 {
                 bail!("Mixing of @{{filename}} and regular arguments isn't supported");
             }
             return parse_from_argument_file(Path::new(path));
-        } else if long_arg_eq("help") {
-            bail!("Sorry, help isn't implemented yet");
-        } else if strip_option(arg)
-            .is_some_and(|stripped_arg| DEFAULT_FLAGS.contains(&stripped_arg))
-        {
-            // These flags are mapped to the default behaviour of the linker.
-        } else if strip_option(arg)
-            .is_some_and(|stripped_arg| IGNORED_FLAGS.contains(&stripped_arg))
-        {
-            warn_unsupported(arg)?;
-        } else if strip_option(arg)
-            .is_some_and(|stripped_arg| SILENTLY_IGNORED_FLAGS.contains(&stripped_arg))
-        {
-        } else if let Some(sysroot) = long_arg_split_prefix("sysroot=") {
-            let sysroot = Path::new(sysroot);
-            args.sysroot = Some(Box::from(sysroot));
-            for path in &mut args.lib_search_path {
-                if let Some(new_path) = maybe_forced_sysroot(path, sysroot) {
-                    *path = new_path;
-                }
-            }
-        } else if arg.starts_with('-') {
-            unrecognised.push(format!("`{arg}`"));
-        } else {
-            save_dir.handle_file(arg)?;
-            args.inputs.push(Input {
-                spec: InputSpec::File(Box::from(Path::new(arg))),
-                search_first: None,
-                modifiers: *modifier_stack.last().unwrap(),
-            });
         }
-    }
+        arg_num += 1;
 
-    if !unrecognised.is_empty() {
-        bail!("Unrecognised argument(s): {}", unrecognised.join(" "));
+        if !arg_parser.handle_argument(&mut args, &mut modifier_stack, arg, &mut input)? {
+            ArgumentParser::handle_positional_argument(&mut args, &modifier_stack, arg);
+        }
     }
 
     // Copy relocations are only permitted when building executables.
@@ -615,7 +418,10 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(mut input: I) -> Resul
         args.allow_copy_relocations = false;
     }
 
-    save_dir.finish()?;
+    if !args.unrecognized_options.is_empty() {
+        let options_list = args.unrecognized_options.join(", ");
+        bail!("unrecognized option(s): {}", options_list);
+    }
 
     Ok(args)
 }
@@ -631,24 +437,22 @@ const fn default_target_arch() -> Architecture {
     {
         Architecture::AArch64
     }
+    #[cfg(target_arch = "riscv64")]
+    {
+        Architecture::RISCV64
+    }
 }
 
 fn parse_from_argument_file(path: &Path) -> Result<Args> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read arguments from file `{}`", path.display()))?;
-    parse(arguments_from_string(&contents)?.into_iter())
+    let arguments = arguments_from_string(&contents)?;
+    parse(|| arguments.iter())
 }
 
 impl Args {
-    pub fn parse<S: AsRef<str>, I: Iterator<Item = S>>(input: I) -> Result<Args> {
+    pub fn parse<F: Fn() -> I, S: AsRef<str>, I: Iterator<Item = S>>(input: F) -> Result<Args> {
         parse(input)
-    }
-
-    pub(crate) fn setup_thread_pool(&self) -> Result {
-        ThreadPoolBuilder::new()
-            .num_threads(self.num_threads.get())
-            .build_global()?;
-        Ok(())
     }
 
     pub(crate) fn base_address(&self) -> u64 {
@@ -724,7 +528,7 @@ impl Args {
 
     pub(crate) fn output_kind(&self) -> OutputKind {
         self.output_kind.unwrap_or({
-            if self.is_dynamic_executable {
+            if self.is_dynamic_executable.load(Ordering::Relaxed) {
                 OutputKind::DynamicExecutable(self.relocation_model)
             } else {
                 OutputKind::StaticExecutable(self.relocation_model)
@@ -736,6 +540,7 @@ impl Args {
         match self.arch {
             Architecture::X86_64 => Alignment { exponent: 12 },
             Architecture::AArch64 => Alignment { exponent: 16 },
+            Architecture::RISCV64 => Alignment { exponent: 12 },
         }
     }
 
@@ -747,6 +552,36 @@ impl Args {
             search_first: None,
             modifiers: Modifiers::default(),
         });
+    }
+
+    /// Sets up the thread pool, using the explicit number of threads if specified,
+    /// or falling back to the jobserver protocol if available.
+    ///
+    /// https://www.gnu.org/software/make/manual/html_node/POSIX-Jobserver.html
+    pub fn activate_thread_pool(mut self) -> Result<ActivatedArgs> {
+        let mut tokens = Vec::new();
+        self.available_threads = self.num_threads.unwrap_or_else(|| {
+            if let Some(client) = &self.jobserver_client {
+                while let Ok(Some(acquired)) = client.try_acquire() {
+                    tokens.push(acquired);
+                }
+                tracing::trace!(count = tokens.len(), "Acquired jobserver tokens");
+                // Our parent "holds" one jobserver token, add it.
+                NonZeroUsize::new((tokens.len() + 1).max(1)).unwrap()
+            } else {
+                std::thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap())
+            }
+        });
+
+        // The pool might be already initialized, suppress the error intentionally.
+        let _ = ThreadPoolBuilder::new()
+            .num_threads(self.available_threads.get())
+            .build_global();
+
+        Ok(ActivatedArgs {
+            args: self,
+            _jobserver_tokens: tokens,
+        })
     }
 }
 
@@ -894,6 +729,1505 @@ fn warn_unsupported(opt: &str) -> Result {
     Ok(())
 }
 
+struct ArgumentParser {
+    options: HashMap<&'static str, OptionHandler>,
+    short_options: HashMap<&'static str, OptionHandler>, // Short option lookup
+    prefix_options: HashMap<&'static str, PrefixOptionHandler>, // For options like -L, -l, etc.
+}
+
+#[derive(Clone)]
+struct OptionHandler {
+    help_text: &'static str,
+    handler: OptionHandlerFn,
+    short_names: Vec<&'static str>,
+}
+
+struct PrefixOptionHandler {
+    help_text: &'static str,
+    handler: fn(&mut Args, &mut Vec<Modifiers>, &str) -> Result<()>,
+    sub_options: HashMap<&'static str, SubOption>,
+}
+
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy)]
+enum OptionHandlerFn {
+    NoParam(fn(&mut Args, &mut Vec<Modifiers>) -> Result<()>),
+    WithParam(fn(&mut Args, &mut Vec<Modifiers>, &str) -> Result<()>),
+    OptionalParam(fn(&mut Args, &mut Vec<Modifiers>, Option<&str>) -> Result<()>),
+}
+
+struct OptionDeclaration<'a, T> {
+    parser: &'a mut ArgumentParser,
+    long_names: Vec<&'static str>,
+    short_names: Vec<&'static str>,
+    prefixes: Vec<&'static str>,
+    sub_options: HashMap<&'static str, SubOption>,
+    help_text: &'static str,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+struct NoParam;
+struct WithParam;
+struct WithOptionalParam;
+
+#[derive(Clone, Copy)]
+struct SubOption {
+    help: &'static str,
+    handler: fn(&mut Args, &mut Vec<Modifiers>, &str) -> Result<()>,
+}
+
+impl Default for ArgumentParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ArgumentParser {
+    #[must_use]
+    fn new() -> Self {
+        Self {
+            options: HashMap::new(),
+            short_options: HashMap::new(),
+            prefix_options: HashMap::new(),
+        }
+    }
+
+    fn declare(&mut self) -> OptionDeclaration<'_, NoParam> {
+        OptionDeclaration {
+            parser: self,
+            long_names: Vec::new(),
+            short_names: Vec::new(),
+            prefixes: Vec::new(),
+            sub_options: HashMap::new(),
+            help_text: "",
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    fn declare_with_param(&mut self) -> OptionDeclaration<'_, WithParam> {
+        OptionDeclaration {
+            parser: self,
+            long_names: Vec::new(),
+            short_names: Vec::new(),
+            prefixes: Vec::new(),
+            sub_options: HashMap::new(),
+            help_text: "",
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    fn declare_with_optional_param(&mut self) -> OptionDeclaration<'_, WithOptionalParam> {
+        OptionDeclaration {
+            parser: self,
+            long_names: Vec::new(),
+            short_names: Vec::new(),
+            prefixes: Vec::new(),
+            sub_options: HashMap::new(),
+            help_text: "",
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    fn handle_argument<S: AsRef<str>, I: Iterator<Item = S>>(
+        &self,
+        args: &mut Args,
+        modifier_stack: &mut Vec<Modifiers>,
+        arg: &str,
+        input: &mut I,
+    ) -> Result<bool> {
+        if let Some(stripped) = strip_option(arg) {
+            // Check for option with '=' syntax
+            if let Some(eq_pos) = stripped.find('=') {
+                let option_name = &stripped[..eq_pos];
+                let value = &stripped[eq_pos + 1..];
+
+                if let Some(handler) = self.options.get(option_name) {
+                    match &handler.handler {
+                        OptionHandlerFn::WithParam(f) => f(args, modifier_stack, value)?,
+                        OptionHandlerFn::OptionalParam(f) => f(args, modifier_stack, Some(value))?,
+                        OptionHandlerFn::NoParam(_) => return Ok(false),
+                    }
+                    return Ok(true);
+                }
+            } else {
+                if stripped == "build-id"
+                    && let Some(handler) = self.options.get(stripped)
+                    && let OptionHandlerFn::WithParam(f) = &handler.handler
+                {
+                    f(args, modifier_stack, "fast")?;
+                    return Ok(true);
+                }
+
+                if let Some(handler) = self.options.get(stripped) {
+                    match &handler.handler {
+                        OptionHandlerFn::NoParam(f) => f(args, modifier_stack)?,
+                        OptionHandlerFn::WithParam(f) => {
+                            let next_arg =
+                                input.next().context(format!("Missing argument to {arg}"))?;
+                            f(args, modifier_stack, next_arg.as_ref())?;
+                        }
+                        OptionHandlerFn::OptionalParam(f) => {
+                            f(args, modifier_stack, None)?;
+                        }
+                    }
+                    return Ok(true);
+                }
+            }
+        }
+
+        if arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 1 {
+            let option_name = &arg[1..];
+            if let Some(handler) = self.short_options.get(option_name) {
+                match &handler.handler {
+                    OptionHandlerFn::NoParam(f) => f(args, modifier_stack)?,
+                    OptionHandlerFn::WithParam(f) => {
+                        let next_arg =
+                            input.next().context(format!("Missing argument to {arg}"))?;
+                        f(args, modifier_stack, next_arg.as_ref())?;
+                    }
+                    OptionHandlerFn::OptionalParam(f) => {
+                        f(args, modifier_stack, None)?;
+                    }
+                }
+                return Ok(true);
+            }
+        }
+
+        // Prefix options. These should be handled after processing long and short options,
+        // because some options (like `-hashstyle=gnu`) can be misinterpreted as prefix options.
+        for (prefix, handler) in &self.prefix_options {
+            if let Some(rest) = arg.strip_prefix(&format!("-{prefix}")) {
+                let value = if rest.is_empty() {
+                    let next_arg = input
+                        .next()
+                        .context(format!("Missing argument to -{prefix}"))?;
+                    next_arg.as_ref().to_owned()
+                } else {
+                    rest.to_owned()
+                };
+
+                // Check if this value corresponds to a registered sub-option
+                if let Some(sub) = handler.sub_options.get(value.as_str()) {
+                    (sub.handler)(args, modifier_stack, &value)?;
+                } else {
+                    // Fall back to the main handler for unregistered sub-options
+                    (handler.handler)(args, modifier_stack, &value)?;
+                }
+                return Ok(true);
+            }
+        }
+
+        if arg.starts_with('-') {
+            if let Some(stripped) = strip_option(arg)
+                && IGNORED_FLAGS.contains(&stripped)
+            {
+                warn_unsupported(arg)?;
+                return Ok(true);
+            }
+
+            args.unrecognized_options.push(arg.to_owned());
+            return Ok(true);
+        }
+
+        args.save_dir.handle_file(arg)?;
+        args.inputs.push(Input {
+            spec: InputSpec::File(Box::from(Path::new(arg))),
+            search_first: None,
+            modifiers: *modifier_stack.last().unwrap(),
+        });
+
+        Ok(false)
+    }
+
+    fn handle_positional_argument(args: &mut Args, modifier_stack: &[Modifiers], arg: &str) {
+        args.inputs.push(Input {
+            spec: InputSpec::File(Box::from(Path::new(arg))),
+            search_first: None,
+            modifiers: *modifier_stack.last().unwrap(),
+        });
+    }
+
+    #[must_use]
+    fn generate_help(&self) -> String {
+        let mut help = String::new();
+        help.push_str("USAGE:\n    wild [OPTIONS] [FILES...]\n\nOPTIONS:\n");
+
+        let mut prefix_options: Vec<_> = self.prefix_options.iter().collect();
+        prefix_options.sort_by_key(|(prefix, _)| *prefix);
+
+        // TODO: This is ad-hoc
+        help.push_str(&format!(
+            "    {:<31} Read options from a file\n",
+            format!("@<VALUE>"),
+        ));
+
+        let mut help_to_options: HashMap<&str, Vec<String>> = HashMap::new();
+        let mut processed_short_options: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+
+        // Collect all long options and their associated short options
+        for (long_name, handler) in &self.options {
+            if !handler.help_text.is_empty() {
+                let mut option_names = vec![format!("--{long_name}")];
+
+                // Add associated short options
+                for short_char in &handler.short_names {
+                    option_names.push(format!("-{short_char}"));
+                }
+
+                help_to_options
+                    .entry(handler.help_text)
+                    .or_default()
+                    .extend(option_names);
+            }
+
+            // Mark short options of help-less handlers as processed
+            for short_name in &handler.short_names {
+                processed_short_options.insert(short_name);
+            }
+        }
+
+        for (prefix, handler) in prefix_options {
+            if !processed_short_options.contains(prefix) && !handler.help_text.is_empty() {
+                help.push_str(&format!(
+                    "    -{:<30} {}\n",
+                    format!("{prefix} <VALUE>"),
+                    handler.help_text
+                ));
+
+                // Add sub-options if they exist
+                let mut sub_options: Vec<_> = handler.sub_options.iter().collect();
+                sub_options.sort_by_key(|(name, _)| *name);
+
+                for (sub_name, sub) in sub_options {
+                    help.push_str(&format!(
+                        "      -{prefix} {sub_name:<30} {sub_help}\n",
+                        sub_help = sub.help
+                    ));
+                }
+            }
+        }
+
+        // Add short-only options
+        for (short_char, handler) in &self.short_options {
+            if !processed_short_options.contains(short_char) && !handler.help_text.is_empty() {
+                help_to_options
+                    .entry(handler.help_text)
+                    .or_default()
+                    .push(format!("-{short_char}"));
+            }
+        }
+
+        let mut sorted_help_groups: Vec<_> = help_to_options.into_iter().collect();
+        sorted_help_groups.sort_by_key(|(_, option_names)| {
+            option_names.iter().min().unwrap_or(&String::new()).clone()
+        });
+
+        for (help_text, mut option_names) in sorted_help_groups {
+            option_names.sort_by(|a, b| {
+                let a_is_short = a.len() == 2 && a.starts_with('-');
+                let b_is_short = b.len() == 2 && b.starts_with('-');
+                match (a_is_short, b_is_short) {
+                    (true, false) => std::cmp::Ordering::Less, // short options first
+                    (false, true) => std::cmp::Ordering::Greater, // long options after
+                    _ => a.cmp(b),                             // same type, alphabetical
+                }
+            });
+
+            let option_names_str = option_names.join(", ");
+            help.push_str(&format!("    {option_names_str:<30} {help_text}\n"));
+        }
+
+        help
+    }
+}
+
+impl<'a, T> OptionDeclaration<'a, T> {
+    #[must_use]
+    fn long(mut self, name: &'static str) -> Self {
+        self.long_names.push(name);
+        self
+    }
+
+    #[must_use]
+    fn short(mut self, option: &'static str) -> Self {
+        self.short_names.push(option);
+        self
+    }
+
+    #[must_use]
+    fn help(mut self, text: &'static str) -> Self {
+        self.help_text = text;
+        self
+    }
+
+    fn prefix(mut self, prefix: &'static str) -> Self {
+        self.prefixes.push(prefix);
+        self
+    }
+
+    #[must_use]
+    fn sub_option(
+        mut self,
+        name: &'static str,
+        help: &'static str,
+        handler: fn(&mut Args, &mut Vec<Modifiers>, &str) -> Result<()>,
+    ) -> Self {
+        self.sub_options.insert(name, SubOption { help, handler });
+        self
+    }
+}
+
+impl<'a> OptionDeclaration<'a, NoParam> {
+    fn execute(self, handler: fn(&mut Args, &mut Vec<Modifiers>) -> Result<()>) {
+        let option_handler = OptionHandler {
+            help_text: self.help_text,
+            handler: OptionHandlerFn::NoParam(handler),
+            short_names: self.short_names.clone(),
+        };
+
+        for name in self.long_names {
+            self.parser.options.insert(name, option_handler.clone());
+        }
+
+        for option in self.short_names {
+            self.parser
+                .short_options
+                .insert(option, option_handler.clone());
+        }
+    }
+}
+
+impl<'a> OptionDeclaration<'a, WithParam> {
+    fn execute(self, handler: fn(&mut Args, &mut Vec<Modifiers>, &str) -> Result<()>) {
+        let mut short_names = self.short_names.clone();
+        short_names.extend_from_slice(&self.prefixes);
+
+        let option_handler = OptionHandler {
+            help_text: self.help_text,
+            handler: OptionHandlerFn::WithParam(handler),
+            short_names,
+        };
+
+        for name in self.long_names {
+            self.parser.options.insert(name, option_handler.clone());
+        }
+
+        for option in self.short_names {
+            self.parser
+                .short_options
+                .insert(option, option_handler.clone());
+        }
+
+        for prefix in self.prefixes {
+            let prefix_handler = PrefixOptionHandler {
+                help_text: self.help_text,
+                sub_options: self.sub_options.clone(),
+                handler,
+            };
+
+            self.parser.prefix_options.insert(prefix, prefix_handler);
+        }
+    }
+}
+
+impl<'a> OptionDeclaration<'a, WithOptionalParam> {
+    fn execute(self, handler: fn(&mut Args, &mut Vec<Modifiers>, Option<&str>) -> Result<()>) {
+        let option_handler = OptionHandler {
+            help_text: self.help_text,
+            handler: OptionHandlerFn::OptionalParam(handler),
+            short_names: self.short_names.clone(),
+        };
+
+        for name in self.long_names {
+            self.parser.options.insert(name, option_handler.clone());
+        }
+
+        for option in self.short_names {
+            self.parser
+                .short_options
+                .insert(option, option_handler.clone());
+        }
+    }
+}
+
+fn strip_option(arg: &str) -> Option<&str> {
+    arg.strip_prefix("--").or(arg.strip_prefix('-'))
+}
+
+fn setup_argument_parser() -> ArgumentParser {
+    let mut parser = ArgumentParser::new();
+
+    parser
+        .declare_with_param()
+        .prefix("L")
+        .help("Add directory to library search path")
+        .execute(|args, _modifier_stack, value| {
+            let handle_sysroot = |path| {
+                args.sysroot
+                    .as_ref()
+                    .and_then(|sysroot| maybe_forced_sysroot(path, sysroot))
+                    .unwrap_or_else(|| Box::from(path))
+            };
+
+            let dir = handle_sysroot(Path::new(value));
+            args.save_dir.handle_file(value)?;
+            args.lib_search_path.push(dir);
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .prefix("l")
+        .help("Link with library")
+        .sub_option(
+            ":filename",
+            "Link with specific file",
+            |args, modifier_stack, value| {
+                let stripped = value.strip_prefix(':').unwrap_or(value);
+                let spec = InputSpec::File(Box::from(Path::new(stripped)));
+                args.inputs.push(Input {
+                    spec,
+                    search_first: None,
+                    modifiers: *modifier_stack.last().unwrap(),
+                });
+                Ok(())
+            },
+        )
+        .sub_option(
+            "libname",
+            "Link with library libname.so or libname.a",
+            |args, modifier_stack, value| {
+                let spec = InputSpec::Lib(Box::from(value));
+                args.inputs.push(Input {
+                    spec,
+                    search_first: None,
+                    modifiers: *modifier_stack.last().unwrap(),
+                });
+                Ok(())
+            },
+        )
+        .execute(|args, modifier_stack, value| {
+            let spec = if let Some(stripped) = value.strip_prefix(':') {
+                InputSpec::File(Box::from(Path::new(stripped)))
+            } else {
+                InputSpec::Lib(Box::from(value))
+            };
+            args.inputs.push(Input {
+                spec,
+                search_first: None,
+                modifiers: *modifier_stack.last().unwrap(),
+            });
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .prefix("u")
+        .help("Force resolution of the symbol")
+        .execute(|args, _modifier_stack, value| {
+            args.undefined.push(value.to_owned());
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .prefix("m")
+        .help("Set target architecture")
+        .sub_option(
+            "elf_x86_64",
+            "x86-64 ELF target",
+            |args, _modifier_stack, _value| {
+                args.arch = Architecture::from_str("elf_x86_64")?;
+                Ok(())
+            },
+        )
+        .sub_option(
+            "aarch64elf",
+            "AArch64 ELF target",
+            |args, _modifier_stack, _value| {
+                args.arch = Architecture::from_str("aarch64elf")?;
+                Ok(())
+            },
+        )
+        .sub_option(
+            "elf64lriscv",
+            "RISC-V 64-bit ELF target",
+            |args, _modifier_stack, _value| {
+                args.arch = Architecture::from_str("elf64lriscv")?;
+                Ok(())
+            },
+        )
+        .execute(|args, _modifier_stack, value| {
+            args.arch = Architecture::from_str(value)?;
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .prefix("z")
+        .help("Linker option")
+        .sub_option(
+            "now",
+            "Resolve all symbols immediately",
+            |_args, _modifier_stack, _value| Ok(()),
+        )
+        .sub_option(
+            "origin",
+            "Mark object as requiring immediate $ORIGIN",
+            |args, _modifier_stack, _value| {
+                args.needs_origin_handling = true;
+                Ok(())
+            },
+        )
+        .sub_option(
+            "relro",
+            "Enable RELRO program header",
+            |args, _modifier_stack, _value| {
+                args.relro = true;
+                Ok(())
+            },
+        )
+        .sub_option(
+            "norelro",
+            "Disable RELRO program header",
+            |args, _modifier_stack, _value| {
+                args.relro = false;
+                Ok(())
+            },
+        )
+        .sub_option(
+            "notext",
+            "Do not report DT_TEXTREL as an error",
+            |_args, _modifier_stack, _value| Ok(()),
+        )
+        .sub_option(
+            "nostart-stop-gc",
+            "Disable start/stop symbol GC",
+            |_args, _modifier_stack, _value| Ok(()),
+        )
+        .sub_option(
+            "execstack",
+            "Mark object as requiring an executable stack",
+            |args, _modifier_stack, _value| {
+                args.execstack = true;
+                Ok(())
+            },
+        )
+        .sub_option(
+            "noexecstack",
+            "Mark object as not requiring an executable stack",
+            |args, _modifier_stack, _value| {
+                args.execstack = false;
+                Ok(())
+            },
+        )
+        .sub_option(
+            "nocopyreloc",
+            "Disable copy relocations",
+            |args, _modifier_stack, _value| {
+                args.allow_copy_relocations = false;
+                Ok(())
+            },
+        )
+        .sub_option(
+            "nodelete",
+            "Mark shared object as non-deletable",
+            |args, _modifier_stack, _value| {
+                args.needs_nodelete_handling = true;
+                Ok(())
+            },
+        )
+        .sub_option(
+            "defs",
+            "Report unresolved symbol references in object files",
+            |args, _modifier_stack, _value| {
+                args.no_undefined = true;
+                Ok(())
+            },
+        )
+        .sub_option(
+            "undefs",
+            "Do not report unresolved symbol references in object files",
+            |args, _modifier_stack, _value| {
+                args.no_undefined = false;
+                Ok(())
+            },
+        )
+        .sub_option(
+            "muldefs",
+            "Allow multiple definitions",
+            |args, _modifier_stack, _value| {
+                args.allow_multiple_definitions = true;
+                Ok(())
+            },
+        )
+        .sub_option(
+            "lazy",
+            "Use lazy binding (default)",
+            |_args, _modifier_stack, _value| Ok(()),
+        )
+        .sub_option(
+            "interpose",
+            "Mark object to interpose all DSOs but executable",
+            |args, _modifier_stack, _value| {
+                args.z_interpose = true;
+                Ok(())
+            },
+        )
+        .execute(|_args, _modifier_stack, _value| Ok(()));
+
+    parser
+        .declare_with_param()
+        .prefix("R")
+        .help("Add runtime library search path")
+        .execute(|args, _modifier_stack, value| {
+            if Path::new(value).is_file() {
+                args.unrecognized_options
+                    .push(format!("-R,{value}(filename)"));
+            } else {
+                append_rpath(&mut args.rpath, value);
+            }
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .prefix("O")
+        .execute(|_args, _modifier_stack, _value|
+        // We don't use opt-level for now.
+        Ok(()));
+
+    parser
+        .declare()
+        .long("static")
+        .long("Bstatic")
+        .help("Disallow linking of shared libraries")
+        .execute(|_args, modifier_stack| {
+            modifier_stack.last_mut().unwrap().allow_shared = false;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("Bdynamic")
+        .help("Allow linking of shared libraries")
+        .execute(|_args, modifier_stack| {
+            modifier_stack.last_mut().unwrap().allow_shared = true;
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("output")
+        .short("o")
+        .help("Set the output filename")
+        .execute(|args, _modifier_stack, value| {
+            args.output = Arc::from(Path::new(value));
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("strip-all")
+        .short("s")
+        .help("Strip all symbols")
+        .execute(|args, _modifier_stack| {
+            args.strip_all = true;
+            args.strip_debug = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("strip-debug")
+        .short("S")
+        .help("Strip debug symbols")
+        .execute(|args, _modifier_stack| {
+            args.strip_debug = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("gc-sections")
+        .help("Enable removal of unused sections")
+        .execute(|args, _modifier_stack| {
+            args.gc_sections = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("no-gc-sections")
+        .help("Disable removal of unused sections")
+        .execute(|args, _modifier_stack| {
+            args.gc_sections = false;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("shared")
+        .long("Bshareable")
+        .help("Create a shared library")
+        .execute(|args, _modifier_stack| {
+            args.output_kind = Some(OutputKind::SharedObject);
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("pie")
+        .help("Create a position-independent executable")
+        .execute(|args, _modifier_stack| {
+            args.relocation_model = RelocationModel::Relocatable;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("no-pie")
+        .help("Create a position-dependent executable (default)")
+        .execute(|args, _modifier_stack| {
+            args.relocation_model = RelocationModel::NonRelocatable;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("help")
+        .help("Show this help message")
+        .execute(|_args, _modifier_stack| {
+            let parser = setup_argument_parser();
+            println!("{}", parser.generate_help());
+
+            // The following listing is something autoconf detection relies on.
+            println!("wild: supported targets: elf64-x86-64 elf64-littleaarch64 elf64-littleriscv");
+            println!("wild: supported emulations: elf_x86_64 aarch64elf elf64lriscv");
+
+            std::process::exit(0);
+        });
+
+    parser
+        .declare()
+        .long("version")
+        .short("v")
+        .help("Show version information")
+        .execute(|args, _modifier_stack| {
+            args.should_print_version = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("demangle")
+        .help("Enable symbol demangling")
+        .execute(|args, _modifier_stack| {
+            args.demangle = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("no-demangle")
+        .help("Disable symbol demangling")
+        .execute(|args, _modifier_stack| {
+            args.demangle = false;
+            Ok(())
+        });
+
+    parser
+        .declare_with_optional_param()
+        .long("time")
+        .help("Show timing information")
+        .execute(|args, _modifier_stack, value| {
+            match value {
+                Some(v) => args.time_phase_options = Some(parse_time_phase_options(v)?),
+                None => args.time_phase_options = Some(Vec::new()),
+            }
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("dynamic-linker")
+        .help("Set dynamic linker path")
+        .execute(|args, _modifier_stack, value| {
+            args.is_dynamic_executable.store(true, Ordering::Relaxed);
+            args.dynamic_linker = Some(Box::from(Path::new(value)));
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("no-dynamic-linker")
+        .help("Omit the load-time dynamic linker request")
+        .execute(|args, _modifier_stack| {
+            args.dynamic_linker = None;
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("entry")
+        .short("e")
+        .help("Set the entry point")
+        .execute(|args, _modifier_stack, value| {
+            args.entry = Some(value.to_owned());
+            Ok(())
+        });
+
+    parser
+        .declare_with_optional_param()
+        .long("threads")
+        .help("Use multiple threads for linking")
+        .execute(|args, _modifier_stack, value| {
+            match value {
+                Some(v) => {
+                    args.num_threads = Some(NonZeroUsize::try_from(v.parse::<usize>()?)?);
+                }
+                None => {
+                    args.num_threads = None; // Default behaviour
+                }
+            }
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("no-threads")
+        .help("Use a single thread")
+        .execute(|args, _modifier_stack| {
+            args.num_threads = Some(NonZeroUsize::new(1).unwrap());
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("as-needed")
+        .help("Set DT_NEEDED if used")
+        .execute(|_args, modifier_stack| {
+            modifier_stack.last_mut().unwrap().as_needed = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("no-as-needed")
+        .help("Always set DT_NEEDED")
+        .execute(|_args, modifier_stack| {
+            modifier_stack.last_mut().unwrap().as_needed = false;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("whole-archive")
+        .help("Include all objects from archives")
+        .execute(|_args, modifier_stack| {
+            modifier_stack.last_mut().unwrap().whole_archive = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("no-whole-archive")
+        .help("Disable --whole-archive")
+        .execute(|_args, modifier_stack| {
+            modifier_stack.last_mut().unwrap().whole_archive = false;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("push-state")
+        .help("Save current linker flags")
+        .execute(|_args, modifier_stack| {
+            modifier_stack.push(*modifier_stack.last().unwrap());
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("pop-state")
+        .help("Restore previous linker flags")
+        .execute(|_args, modifier_stack| {
+            modifier_stack.pop();
+            if modifier_stack.is_empty() {
+                bail!("Mismatched --pop-state");
+            }
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("eh-frame-hdr")
+        .help("Create .eh_frame_hdr section")
+        .execute(|args, _modifier_stack| {
+            args.should_write_eh_frame_hdr = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("export-dynamic")
+        .short("E")
+        .help("Export all dynamic symbols")
+        .execute(|args, _modifier_stack| {
+            args.export_all_dynamic_symbols = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("no-export-dynamic")
+        .help("Do not export dynamic symbols")
+        .execute(|args, _modifier_stack| {
+            args.export_all_dynamic_symbols = false;
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("soname")
+        .prefix("h")
+        .help("Set shared object name")
+        .execute(|args, _modifier_stack, value| {
+            args.soname = Some(value.to_owned());
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("rpath")
+        .help("Add directory to runtime library search path")
+        .execute(|args, _modifier_stack, value| {
+            append_rpath(&mut args.rpath, value);
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("no-string-merge")
+        .help("Disable string merging")
+        .execute(|args, _modifier_stack| {
+            args.merge_strings = false;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("no-undefined")
+        .help("Do not allow unresolved symbols in object files")
+        .execute(|args, _modifier_stack| {
+            args.no_undefined = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("allow-multiple-definition")
+        .help("Allow multiple definitions of symbols")
+        .execute(|args, _modifier_stack| {
+            args.allow_multiple_definitions = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("relax")
+        .help("Enable target-specific optimization (instruction relaxation)")
+        .execute(|args, _modifier_stack| {
+            args.relax = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("no-relax")
+        .help("Disable relaxation")
+        .execute(|args, _modifier_stack| {
+            args.relax = false;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("validate-output")
+        .execute(|args, _modifier_stack| {
+            args.validate_output = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("write-layout")
+        .execute(|args, _modifier_stack| {
+            args.write_layout = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("write-trace")
+        .execute(|args, _modifier_stack| {
+            args.write_trace = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("got-plt-syms")
+        .help("Write symbol table entries that point to the GOT/PLT entry for symbols")
+        .execute(|args, _modifier_stack| {
+            args.got_plt_syms = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("Bsymbolic")
+        .help("Bind global references locally")
+        .execute(|args, _modifier_stack| {
+            args.b_symbolic = BSymbolicKind::All;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("Bsymbolic-functions")
+        .help("Bind global function references locally")
+        .execute(|args, _modifier_stack| {
+            args.b_symbolic = BSymbolicKind::Functions;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("Bsymbolic-non-weak-functions")
+        .help("Bind non-weak global function references locally")
+        .execute(|args, _modifier_stack| {
+            args.b_symbolic = BSymbolicKind::NonWeakFunctions;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("Bsymbolic-non-weak")
+        .help("Bind non-weak global references locally")
+        .execute(|args, _modifier_stack| {
+            args.b_symbolic = BSymbolicKind::NonWeak;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("Bno-symbolic")
+        .help("Do not bind global symbol references locally")
+        .execute(|args, _modifier_stack| {
+            args.b_symbolic = BSymbolicKind::None;
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("thread-count")
+        .help("Set the number of threads to use")
+        .execute(|args, _modifier_stack, value| {
+            args.num_threads = Some(NonZeroUsize::try_from(value.parse::<usize>()?)?);
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("exclude-libs")
+        .help("Exclude libraries")
+        .execute(|args, _modifier_stack, value| {
+            if value != "ALL" {
+                warn_unsupported("--exclude-libs other than ALL")?;
+            }
+            args.exclude_libs = true;
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("version-script")
+        .help("Use version script")
+        .execute(|args, _modifier_stack, value| {
+            args.save_dir.handle_file(value)?;
+            args.version_script_path = Some(PathBuf::from(value));
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("script")
+        .prefix("T")
+        .help("Use linker script")
+        .execute(|args, _modifier_stack, value| {
+            args.save_dir.handle_file(value)?;
+            args.add_script(value);
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("export-dynamic-symbol")
+        .help("Export dynamic symbol")
+        .execute(|args, _modifier_stack, value| {
+            args.export_list.push(value.to_owned());
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("export-dynamic-symbol-list")
+        .help("Export dynamic symbol list")
+        .execute(|args, _modifier_stack, value| {
+            args.export_list_path = Some(PathBuf::from(value));
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("dynamic-list")
+        .help("Read the dynamic symbol list from a file")
+        .execute(|args, _modifier_stack, value| {
+            args.b_symbolic = BSymbolicKind::All;
+            args.export_list_path = Some(PathBuf::from(value));
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("write-gc-stats")
+        .help("Write GC statistics")
+        .execute(|args, _modifier_stack, value| {
+            args.write_gc_stats = Some(PathBuf::from(value));
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("gc-stats-ignore")
+        .help("Ignore files in GC stats")
+        .execute(|args, _modifier_stack, value| {
+            args.gc_stats_ignore.push(value.to_owned());
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("debug-address")
+        .help("Set debug address")
+        .execute(|args, _modifier_stack, value| {
+            args.debug_address = Some(parse_number(value).context("Invalid --debug-address")?);
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("debug-fuel")
+        .execute(|args, _modifier_stack, value| {
+            args.debug_fuel = Some(AtomicI64::new(value.parse()?));
+            args.num_threads = Some(NonZeroUsize::new(1).unwrap());
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("unresolved-symbols")
+        .help("Specify how to handle unresolved symbols")
+        .execute(|args, _modifier_stack, value| {
+            args.unresolved_symbols = match value {
+                "report-all" => UnresolvedSymbols::ReportAll,
+                "ignore-in-shared-libs" => UnresolvedSymbols::IgnoreInSharedLibs,
+                "ignore-in-object-files" => UnresolvedSymbols::IgnoreInObjectFiles,
+                "ignore-all" => UnresolvedSymbols::IgnoreAll,
+                _ => bail!("Invalid unresolved-symbols value {value}"),
+            };
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("undefined")
+        .help("Force resolution of the symbol")
+        .execute(|args, _modifier_stack, value| {
+            args.undefined.push(value.to_owned());
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("wrap")
+        .help("Use a wrapper function")
+        .execute(|args, _modifier_stack, value| {
+            args.wrap.push(value.to_owned());
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("hash-style")
+        .help("Set hash style")
+        .execute(|_args, _modifier_stack, value| {
+            if value != "gnu" && value != "both" {
+                bail!("Unsupported hash-style `{value}`");
+            }
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("build-id")
+        .help("Generate build ID")
+        .execute(|args, _modifier_stack, value| {
+            args.build_id = match value {
+                "none" => BuildIdOption::None,
+                "fast" | "md5" | "sha1" => BuildIdOption::Fast,
+                "uuid" => BuildIdOption::Uuid,
+                s if s.starts_with("0x") || s.starts_with("0X") => {
+                    let hex_string = &s[2..];
+                    let decoded_bytes = hex::decode(hex_string)
+                        .with_context(|| format!("Invalid Hex Build Id `0x{hex_string}`"))?;
+                    BuildIdOption::Hex(decoded_bytes)
+                }
+                s => bail!(
+                    "Invalid build-id value `{s}` valid values are `none`, `fast`, `md5`, `sha1` and `uuid`"
+                ),
+            };
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("icf")
+        .help("Enable identical code folding (merge duplicate functions)")
+        .execute(|_args, _modifier_stack, value| {
+            match value {
+                "none" => {}
+                other => warn_unsupported(&format!("--icf={other}"))?,
+            }
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("sysroot")
+        .help("Set system root")
+        .execute(|args, _modifier_stack, value| {
+            args.save_dir.handle_file(value)?;
+            let sysroot = std::fs::canonicalize(value).unwrap_or_else(|_| PathBuf::from(value));
+            args.sysroot = Some(Box::from(sysroot.as_path()));
+            for path in &mut args.lib_search_path {
+                if let Some(new_path) = maybe_forced_sysroot(path, &sysroot) {
+                    *path = new_path;
+                }
+            }
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("plugin-opt")
+        .help("Pass options to the plugin")
+        .execute(|_args, _modifier_stack, _value| {
+            // TODO: Implement support for linker plugins.
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("dependency-file")
+        .help("Write dependency rules")
+        .execute(|_args, _modifier_stack, value| {
+            warn_unsupported(&format!("--dependency-file={value}"))?;
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("plugin")
+        .help("Load plugin")
+        .execute(|_args, _modifier_stack, value| {
+            warn_unsupported(&format!("--plugin {value}"))?;
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("rpath-link")
+        .help("Add runtime library search path")
+        .execute(|_args, _modifier_stack, _value| {
+            // TODO
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("sym-info")
+        .help("Show symbol information")
+        .execute(|args, _modifier_stack, value| {
+            args.sym_info = Some(value.to_owned());
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("start-lib")
+        .help("Start library group")
+        .execute(|_args, modifier_stack| {
+            modifier_stack.last_mut().unwrap().archive_semantics = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("end-lib")
+        .help("End library group")
+        .execute(|_args, modifier_stack| {
+            modifier_stack.last_mut().unwrap().archive_semantics = false;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("no-fork")
+        .help("Do not fork while linking")
+        .execute(|args, _modifier_stack| {
+            args.should_fork = false;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("update-in-place")
+        .help("Update file in place")
+        .execute(|args, _modifier_stack| {
+            args.file_write_mode = Some(FileWriteMode::UpdateInPlace);
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("EB")
+        .help("Big-endian (not supported)")
+        .execute(|_args, _modifier_stack| {
+            bail!("Big-endian target is not supported");
+        });
+
+    parser
+        .declare()
+        .long("prepopulate-maps")
+        .help("Prepopulate maps")
+        .execute(|args, _modifier_stack| {
+            args.prepopulate_maps = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("verbose-gc-stats")
+        .help("Show GC statistics")
+        .execute(|args, _modifier_stack| {
+            args.verbose_gc_stats = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("allow-shlib-undefined")
+        .help("Allow undefined symbol references in shared libraries")
+        .execute(|args, _modifier_stack| {
+            args.allow_shlib_undefined = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("no-allow-shlib-undefined")
+        .help("Disallow undefined symbol references in shared libraries")
+        .execute(|args, _modifier_stack| {
+            args.allow_shlib_undefined = false;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("error-unresolved-symbols")
+        .help("Treat unresolved symbols as errors")
+        .execute(|args, _modifier_stack| {
+            args.error_unresolved_symbols = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("warn-unresolved-symbols")
+        .help("Treat unresolved symbols as warnings")
+        .execute(|args, _modifier_stack| {
+            args.error_unresolved_symbols = false;
+            Ok(())
+        });
+
+    add_silently_ignored_flags(&mut parser);
+    add_default_flags(&mut parser);
+
+    parser
+}
+
+fn add_silently_ignored_flags(parser: &mut ArgumentParser) {
+    for flag in SILENTLY_IGNORED_FLAGS {
+        let mut declaration = parser.declare();
+        declaration = declaration.long(flag);
+        declaration.execute(|_args, _modifier_stack| Ok(()));
+    }
+    for flag in SILENTLY_IGNORED_SHORT_FLAGS {
+        let mut declaration = parser.declare();
+        declaration = declaration.short(flag);
+        declaration.execute(|_args, _modifier_stack| Ok(()));
+    }
+}
+
+fn add_default_flags(parser: &mut ArgumentParser) {
+    for flag in DEFAULT_FLAGS {
+        let mut declaration = parser.declare();
+        declaration = declaration.long(flag);
+        declaration.execute(|_args, _modifier_stack| Ok(()));
+    }
+    for flag in DEFAULT_SHORT_FLAGS {
+        let mut declaration = parser.declare();
+        declaration = declaration.short(flag);
+        declaration.execute(|_args, _modifier_stack| Ok(()));
+    }
+}
+
+fn parse_time_phase_options(input: &str) -> Result<Vec<CounterKind>> {
+    input.split(',').map(|s| s.parse()).collect()
+}
+
+impl FromStr for CounterKind {
+    type Err = crate::error::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(match s {
+            "cycles" => CounterKind::Cycles,
+            "instructions" => CounterKind::Instructions,
+            "cache-misses" => CounterKind::CacheMisses,
+            "branch-misses" => CounterKind::BranchMisses,
+            "page-faults" => CounterKind::PageFaults,
+            "page-faults-minor" => CounterKind::PageFaultsMinor,
+            "page-faults-major" => CounterKind::PageFaultsMajor,
+            "l1d-read" => CounterKind::L1dRead,
+            "l1d-miss" => CounterKind::L1dMiss,
+            other => bail!("Unsupported performance counter `{other}`"),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::SILENTLY_IGNORED_FLAGS;
@@ -997,6 +2331,9 @@ mod tests {
         "--discard-locals",
         "-X",
         "-EL",
+        "-O",
+        "1",
+        "-O3",
         "-v",
         "--sysroot=/usr/aarch64-linux-gnu",
         "--demangle",
@@ -1005,6 +2342,9 @@ mod tests {
         "-rpath",
         "foo/",
         "-rpath=bar/",
+        "-Rbaz",
+        "-R",
+        "somewhere",
     ];
 
     #[track_caller]
@@ -1014,7 +2354,7 @@ mod tests {
 
     #[test]
     fn test_parse() {
-        let args = super::parse(INPUT1.iter()).unwrap();
+        let args = super::parse(|| INPUT1.iter()).unwrap();
         assert!(args.is_relocatable());
         assert_eq!(
             args.inputs
@@ -1037,7 +2377,7 @@ mod tests {
             Some(PathBuf::from_str("a.ver").unwrap())
         );
         assert_eq!(args.soname, Some("bar".to_owned()));
-        assert_eq!(args.num_threads, NonZeroUsize::new(1).unwrap());
+        assert_eq!(args.num_threads, Some(NonZeroUsize::new(1).unwrap()));
         assert!(args.should_print_version);
         assert_eq!(
             args.sysroot,
@@ -1047,7 +2387,7 @@ mod tests {
             InputSpec::File(f) => f.as_ref() == Path::new("lib85caec4suo0pxg06jm2ma7b0o.so"),
             InputSpec::Lib(_) => false,
         }));
-        assert_eq!(args.rpath.as_deref(), Some("foo/:bar/"));
+        assert_eq!(args.rpath.as_deref(), Some("foo/:bar/:baz:somewhere"));
     }
 
     #[test]

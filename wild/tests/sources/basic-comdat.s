@@ -1,8 +1,11 @@
+/* For some reason, GAS on riscv64 does not support '//' comments.
 //#Object:basic-comdat-1.s
-//#RunEnabled:false
-//#Static:false
+//#Mode:dynamic
 //#LinkArgs:-shared -z now
 //#DiffIgnore:section.got
+//#DiffIgnore:segment.GNU_STACK.alignment
+//#DiffIgnore:segment.GNU_STACK.flags
+*/
 
 .section .data.foo1,"awG",@progbits,foobar,comdat
 .globl foo1

@@ -154,13 +154,12 @@ fn compare_sections<A: Arch>(
 ) -> Result {
     let original_section = section_versions.original_section(layout)?;
 
-    if let Some(coverage) = report.coverage.as_mut() {
-        if let Some(sec_cov) = coverage
+    if let Some(coverage) = report.coverage.as_mut()
+        && let Some(sec_cov) = coverage
             .sections
             .get_mut(&section_versions.input_section_id)
-        {
-            sec_cov.diffed = true;
-        }
+    {
+        sec_cov.diffed = true;
     }
 
     // We already filtered input sections based on their kind. Now we filter based on the output
@@ -371,30 +370,30 @@ impl<'data, A: Arch> RelaxationGroup<'data, A> {
 
     fn eliminate_alt_r_types(&mut self, reference: &Reference<A::RType>) {
         for result in &mut self.match_results {
-            if let RelaxationMatchResult::Matched(m) = result {
-                if let Some(alt_r_type) = m.relaxation.alt_r_type {
-                    // Some relaxations cannot be identified purely by the instruction bytes. For example
-                    // relaxing a PLT32 to a PC32, the instruction bytes are left the same. All that differs is
-                    // whether we now point to the PLT or not.
+            if let RelaxationMatchResult::Matched(m) = result
+                && let Some(alt_r_type) = m.relaxation.alt_r_type
+            {
+                // Some relaxations cannot be identified purely by the instruction bytes. For example
+                // relaxing a PLT32 to a PC32, the instruction bytes are left the same. All that differs is
+                // whether we now point to the PLT or not.
 
-                    match (
-                        reference.verify_consistent_with_r_type(m.relaxation.new_r_type),
-                        reference.verify_consistent_with_r_type(alt_r_type),
-                    ) {
-                        (Err(_), Ok(())) => {
-                            m.relaxation.new_r_type = alt_r_type;
-                        }
-                        (Ok(()), Err(_)) => {
-                            m.relaxation.alt_r_type = None;
-                        }
-                        _ => {}
+                match (
+                    reference.verify_consistent_with_r_type(m.relaxation.new_r_type),
+                    reference.verify_consistent_with_r_type(alt_r_type),
+                ) {
+                    (Err(_), Ok(())) => {
+                        m.relaxation.new_r_type = alt_r_type;
                     }
+                    (Ok(()), Err(_)) => {
+                        m.relaxation.alt_r_type = None;
+                    }
+                    _ => {}
                 }
             }
         }
     }
 
-    fn matches_if_ok(&self) -> Option<Vec<RelaxationMatch<A>>> {
+    fn matches_if_ok(&self) -> Option<Vec<RelaxationMatch<'data, A>>> {
         self.match_results
             .iter()
             .map(|r| match r {
@@ -405,7 +404,7 @@ impl<'data, A: Arch> RelaxationGroup<'data, A> {
             .ok()
     }
 
-    fn matches_skipping_nops(&self) -> Vec<&RelaxationMatchResult<A>> {
+    fn matches_skipping_nops(&self) -> Vec<&RelaxationMatchResult<'data, A>> {
         self.match_results
             .iter()
             .filter(|result| !matches!(result, RelaxationMatchResult::Matched(m) if m.relaxation.relaxation_kind.is_replace_with_no_op()))
@@ -798,6 +797,17 @@ fn diff_key_for_res_mismatch<A: Arch>(
                 return "rel.dynamic-plt-bypass".to_owned();
             }
         }
+        (Referent::Named(ours, _), Referent::Undefined(_)) => {
+            // We defined a symbol that the reference linker didn't.
+            return format!("rel.extra-symbol.{ours}");
+        }
+        (Referent::Named(_, _), Referent::DynamicRelocation(_)) => {
+            if resolutions[0].reference.indirection == Indirection::Got
+                && resolutions[1].reference.indirection == Indirection::Got
+            {
+                return format!("rel.missing-got-dynamic.{}", bin_attributes.output_kind);
+            }
+        }
         _ => {}
     }
 
@@ -1160,19 +1170,18 @@ impl<A: Arch> RelocationInstructionBlock<'_, A> {
 
             writeln!(f, "{:instruction_padding$}] {}", "", out.purple())?;
 
-            if let Some(annotation) = annotations.peek() {
-                if annotation.offset_in_section >= instruction_offset
-                    && annotation.offset_in_section < instruction_end
-                {
-                    let num_spaces = name_width
-                        + address_width
-                        + 7
-                        + (annotation.offset_in_section - instruction_offset) as usize * 3;
+            if let Some(annotation) = annotations.peek()
+                && annotation.offset_in_section >= instruction_offset
+                && annotation.offset_in_section < instruction_end
+            {
+                let num_spaces = name_width
+                    + address_width
+                    + 7
+                    + (annotation.offset_in_section - instruction_offset) as usize * 3;
 
-                    annotation.write(f, &format!("{:num_spaces$}", ""))?;
+                annotation.write(f, &format!("{:num_spaces$}", ""))?;
 
-                    annotations.next();
-                }
+                annotations.next();
             }
         }
 
@@ -1467,6 +1476,10 @@ enum Referent<'data, R: RType> {
     TlsModuleId,
     TlsDescCall,
     TlsDesc(SymtabEntryInfo<'data>),
+
+    /// No relocation is applied. This is used for example when a TLSLD relocation is optimised
+    /// away.
+    NoRelocation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1570,6 +1583,7 @@ impl<R: RType> Referent<'_, R> {
             Referent::TlsModuleId => write!(f, "TlsModuleId")?,
             Referent::TlsGd(symbol) => write!(f, "TlsGd({symbol})")?,
             Referent::TlsDescCall => write!(f, "TlsDescCall")?,
+            Referent::NoRelocation => write!(f, "NoRelocation")?,
         }
 
         Ok(())
@@ -1660,7 +1674,7 @@ fn arrow() -> ColoredString {
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
-enum BasicValueKind {
+pub(crate) enum BasicValueKind {
     /// The value is a pointer. We can do things like check to see if it's pointing to a PLT or
     /// GOT entry. If we tried to do that with things that weren't pointers, then we might get
     /// false PLT/GOT matches.
@@ -1727,7 +1741,7 @@ impl<'data> RelaxationTester<'data> {
                 section_bytes = None;
             }
             _ => {
-                section_bytes = read_bytes(bin.elf_file, section_address, section_len);
+                section_bytes = read_bytes(bin.elf_file, section_address, section_len)?;
 
                 if section_bytes.is_none() {
                     bail!(
@@ -1889,6 +1903,9 @@ impl<'data> RelaxationTester<'data> {
         let mut addend = 0;
         let mut referent = None;
 
+        // Whether all relocations have been optimised away.
+        let mut all_none = true;
+
         let mut value_kind = ValueKind::OptionalPlt;
 
         // Empty groups are not permitted.
@@ -1957,9 +1974,13 @@ impl<'data> RelaxationTester<'data> {
             let relative_to = self.get_relative_to::<A>(offset, relocation_info)?;
 
             if let Some(kind) =
-                value_kind_for_relocation(relocation_info.kind, &self.bin.address_index)
+                value_kind_for_relocation::<A>(relocation_info.kind, &self.bin.address_index)
             {
                 value_kind = kind;
+            }
+
+            if relocation_info.kind != RelocationKind::None {
+                all_none = false;
             }
 
             match relocation_info.kind {
@@ -1978,6 +1999,10 @@ impl<'data> RelaxationTester<'data> {
             value = relative_to.wrapping_add(value);
 
             merged_value = merged_value.wrapping_add(value);
+        }
+
+        if all_none {
+            referent = Some(Referent::NoRelocation);
         }
 
         // The relocation info for our primary and alt r-types should be the same for our purposes
@@ -2204,6 +2229,8 @@ impl<'data> RelaxationTester<'data> {
         };
 
         let bytes = read_bytes_starting_at(self.bin.elf_file, string_address)
+            .ok()
+            .flatten()
             .with_context(|| format!("Failed to read bytes starting at 0x{string_address:x}"))?;
         let null_offset = memchr::memchr(0, bytes).with_context(|| {
             format!("Missing null-terminator for merged string starting at 0x{string_address:x}")
@@ -2223,6 +2250,7 @@ impl<'data> RelaxationTester<'data> {
     ) -> Result<u64> {
         let mut relative_to = match relocation_info.kind {
             RelocationKind::Relative
+            | RelocationKind::RelativeRiscVLow12
             | RelocationKind::PltRelative
             | RelocationKind::TlsGd
             | RelocationKind::TlsLd
@@ -2241,6 +2269,11 @@ impl<'data> RelaxationTester<'data> {
                 .got_base_address
                 .context("Missing GOT base address")?,
             RelocationKind::Absolute
+            | RelocationKind::AbsoluteSet
+            | RelocationKind::AbsoluteSetWord6
+            | RelocationKind::AbsoluteAddition
+            | RelocationKind::AbsoluteSubtraction
+            | RelocationKind::AbsoluteSubtractionWord6
             | RelocationKind::Got
             | RelocationKind::TlsGdGot
             | RelocationKind::GotTpOffGot
@@ -2249,9 +2282,10 @@ impl<'data> RelaxationTester<'data> {
             | RelocationKind::TlsLdGot
             | RelocationKind::DtpOff
             | RelocationKind::TpOff
-            | RelocationKind::TpOffAArch64
             | RelocationKind::TlsDescCall
-            | RelocationKind::None => 0,
+            | RelocationKind::PairSubtraction
+            | RelocationKind::None
+            | RelocationKind::Alignment => 0,
         };
 
         relative_to &= A::get_relocation_base_mask(&relocation_info);
@@ -2326,14 +2360,13 @@ impl<'data> RelaxationTester<'data> {
         let mut reference = None;
         let mut error = None;
 
-        if relaxation_group.is_complete {
-            if let Some(matches) = relaxation_group.matches_if_ok() {
-                if matches_are_compatible(&matches) {
-                    match self.read_reference(&matches) {
-                        Ok(r) => reference = Some(r),
-                        Err(e) => error = Some(e),
-                    }
-                }
+        if relaxation_group.is_complete
+            && let Some(matches) = relaxation_group.matches_if_ok()
+            && matches_are_compatible(&matches)
+        {
+            match self.read_reference(&matches) {
+                Ok(r) => reference = Some(r),
+                Err(e) => error = Some(e),
             }
         }
 
@@ -2418,29 +2451,35 @@ fn matches_are_compatible<A: Arch>(matches: &[RelaxationMatch<'_, A>]) -> bool {
 }
 
 /// Returns what kind of value we can expect when we extract the value written by a relocation.
-fn value_kind_for_relocation(
+fn value_kind_for_relocation<A: Arch>(
     relocation_kind: RelocationKind,
     address_index: &AddressIndex,
 ) -> Option<ValueKind> {
     let kind = match relocation_kind {
-        RelocationKind::Absolute | RelocationKind::AbsoluteAArch64 => {
+        RelocationKind::Absolute
+        | RelocationKind::AbsoluteAArch64
+        | RelocationKind::AbsoluteSet
+        | RelocationKind::AbsoluteSetWord6
+        | RelocationKind::AbsoluteAddition
+        | RelocationKind::AbsoluteSubtraction
+        | RelocationKind::AbsoluteSubtractionWord6 => {
             if address_index.is_relocatable() {
                 ValueKind::Unwrapped(BasicValueKind::AbsoluteValue)
             } else {
                 return None;
             }
         }
-        RelocationKind::Relative | RelocationKind::SymRelGotBase => {
+        RelocationKind::Relative
+        | RelocationKind::RelativeRiscVLow12
+        | RelocationKind::SymRelGotBase => {
             return None;
         }
         RelocationKind::PltRelative | RelocationKind::PltRelGotBase => ValueKind::OptionalPlt,
         RelocationKind::Got | RelocationKind::GotRelGotBase | RelocationKind::GotRelative => {
             ValueKind::Got(BasicValueKind::Pointer)
         }
-        RelocationKind::DtpOff | RelocationKind::TpOff => {
-            ValueKind::Unwrapped(BasicValueKind::TlsOffset)
-        }
-        RelocationKind::TpOffAArch64 => ValueKind::Unwrapped(BasicValueKind::Aarch64TlsOffset),
+        RelocationKind::DtpOff => ValueKind::Unwrapped(BasicValueKind::TlsOffset),
+        RelocationKind::TpOff => ValueKind::Unwrapped(A::get_basic_value_for_tp_offset()),
         RelocationKind::GotTpOff
         | RelocationKind::GotTpOffGot
         | RelocationKind::GotTpOffGotBase => ValueKind::Got(BasicValueKind::TlsOffset),
@@ -2458,7 +2497,12 @@ fn value_kind_for_relocation(
             // Same as above.
             ValueKind::Got(BasicValueKind::TlsGd)
         }
-        RelocationKind::TlsDescCall | RelocationKind::None => return None,
+        RelocationKind::TlsDescCall
+        | RelocationKind::None
+        | RelocationKind::PairSubtraction
+        | RelocationKind::Alignment => {
+            return None;
+        }
     };
 
     Some(kind)
@@ -2787,7 +2831,7 @@ impl PltIndex<'_> {
 
         let offset = plt_address - self.plt_base;
 
-        if self.entry_length != 0 && offset % self.entry_length != 0 {
+        if self.entry_length != 0 && !offset.is_multiple_of(self.entry_length) {
             bail!(
                 "PLT address 0x{plt_address:x} is not aligned to 0x{:x}",
                 self.entry_length
@@ -3102,11 +3146,15 @@ impl<'data> AddressIndex<'data> {
         };
 
         let data = got_section.data()?;
-        let entry_size = size_of::<u64>();
-
-        let raw_entries: &[u64] = object::slice_from_bytes(data, data.len() / entry_size)
-            .unwrap()
-            .0;
+        let raw_entries: &[u64] = if data.is_empty() {
+            // An empty .got may not be aligned, so we avoid calling object::slice_from_bytes.
+            &[]
+        } else {
+            let entry_size = size_of::<u64>();
+            object::slice_from_bytes(data, data.len() / entry_size)
+                .unwrap()
+                .0
+        };
 
         let base = got_section.address();
         Ok(Some(GotIndex {
@@ -3248,7 +3296,7 @@ impl<'data> GotIndex<'data> {
             .context("got_address outside index range")?;
 
         let entry_size = size_of::<u64>() as u64;
-        if offset % entry_size != 0 {
+        if !offset.is_multiple_of(entry_size) {
             bail!("Unaligned reference to GOT 0x{got_address:x}");
         }
 
@@ -3293,7 +3341,7 @@ impl<'data> GotIndex<'data> {
                             // variable within the current DSO. Read the next word of data to get the
                             // offset.
                             let tls_offset =
-                                read_word_at(bin.elf_file, got_address + size_of::<u64>() as u64)
+                                read_word_at(bin.elf_file, got_address + size_of::<u64>() as u64)?
                                     .context("Short read after DTPMOD")?
                                     as i64;
                             Ok(Referent::UnmatchedTlsOffset(tls_offset))
@@ -3323,7 +3371,7 @@ impl<'data> GotIndex<'data> {
             }
         } else {
             // No dynamic relocation, just read from the original file data.
-            let raw_value = self
+            let raw_value = *self
                 .entries
                 .get((offset / entry_size) as usize)
                 .context("got_address past end of index range")?;
@@ -3332,19 +3380,27 @@ impl<'data> GotIndex<'data> {
                 RelocationKind::GotTpOff
                 | RelocationKind::GotTpOffGot
                 | RelocationKind::GotTpOffGotBase => {
-                    Ok(Referent::UnmatchedTlsOffset(*raw_value as i64))
+                    Ok(Referent::UnmatchedTlsOffset(raw_value as i64))
                 }
                 RelocationKind::TlsDescCall => Ok(Referent::TlsDescCall),
                 RelocationKind::Absolute
                 | RelocationKind::AbsoluteAArch64
+                | RelocationKind::AbsoluteSet
+                | RelocationKind::AbsoluteSetWord6
+                | RelocationKind::AbsoluteAddition
+                | RelocationKind::AbsoluteSubtraction
+                | RelocationKind::AbsoluteSubtractionWord6
                 | RelocationKind::Relative
+                | RelocationKind::RelativeRiscVLow12
                 | RelocationKind::SymRelGotBase
                 | RelocationKind::GotRelGotBase
                 | RelocationKind::Got
                 | RelocationKind::PltRelGotBase
                 | RelocationKind::PltRelative
                 | RelocationKind::GotRelative
-                | RelocationKind::None => Ok(Referent::Absolute(*raw_value)),
+                | RelocationKind::None
+                | RelocationKind::PairSubtraction
+                | RelocationKind::Alignment => Ok(Referent::Absolute(raw_value)),
                 RelocationKind::TlsGd
                 | RelocationKind::TlsGdGot
                 | RelocationKind::TlsGdGotBase
@@ -3353,7 +3409,6 @@ impl<'data> GotIndex<'data> {
                 | RelocationKind::TlsLdGotBase
                 | RelocationKind::DtpOff
                 | RelocationKind::TpOff
-                | RelocationKind::TpOffAArch64
                 | RelocationKind::TlsDesc
                 | RelocationKind::TlsDescGot
                 | RelocationKind::TlsDescGotBase => {
@@ -3397,9 +3452,9 @@ struct DynamicRelocation<'data, R: RType> {
 }
 
 /// Attempts to read some data starting at `address` up to the end of the segment.
-fn read_segment<'data>(elf_file: &ElfFile64<'data>, address: u64) -> Option<Data<'data>> {
+fn read_segment<'data>(elf_file: &ElfFile64<'data>, address: u64) -> Result<Option<Data<'data>>> {
     // This could well end up needing to be optimised if we end up caring about performance.
-    for raw_seg in elf_file.elf_program_headers() {
+    for (seg_index, raw_seg) in elf_file.elf_program_headers().iter().enumerate() {
         let e = LittleEndian;
         if raw_seg.p_type(e) != object::elf::PT_LOAD {
             continue;
@@ -3415,34 +3470,52 @@ fn read_segment<'data>(elf_file: &ElfFile64<'data>, address: u64) -> Option<Data
             let file_end = file_start + file_size;
             let file_bytes = elf_file.data();
             if file_bytes.is_empty() {
-                return Some(Data::Bss);
+                return Ok(Some(Data::Bss));
             }
-            let bytes = &file_bytes[file_start..file_end];
-            return Some(Data::Bytes(&bytes[start..]));
+            let bytes = &file_bytes
+                .get(file_start + start..file_end)
+                .with_context(|| format!("Invalid ELF segment {seg_index}"))?;
+            return Ok(Some(Data::Bytes(bytes)));
         }
     }
-    None
+    Ok(None)
 }
 
-fn read_word_at(elf_file: &ElfFile64, address: u64) -> Option<u64> {
-    let bytes = read_bytes(elf_file, address, size_of::<u64>() as u64)?;
-    Some(u64::from_le_bytes(*bytes.first_chunk()?))
+fn read_word_at(elf_file: &ElfFile64, address: u64) -> Result<Option<u64>> {
+    let Some(bytes) = read_bytes(elf_file, address, size_of::<u64>() as u64)? else {
+        return Ok(None);
+    };
+    let Some(chunk) = bytes.first_chunk() else {
+        return Ok(None);
+    };
+    Ok(Some(u64::from_le_bytes(*chunk)))
 }
 
-fn read_bytes<'data>(elf_file: &ElfFile64<'data>, address: u64, len: u64) -> Option<&'data [u8]> {
-    read_segment(elf_file, address).and_then(|data| match data {
-        Data::Bytes(bytes) => bytes.get(..len as usize),
-        Data::Bss => None,
-    })
+fn read_bytes<'data>(
+    elf_file: &ElfFile64<'data>,
+    address: u64,
+    len: u64,
+) -> Result<Option<&'data [u8]>> {
+    Ok(
+        read_segment(elf_file, address)?.and_then(|data| match data {
+            Data::Bytes(bytes) => bytes.get(..len as usize),
+            Data::Bss => None,
+        }),
+    )
 }
 
 /// Returns bytes starting at `address` up to the end of the containing segment. This is useful when
 /// you don't know what length you need to read, e.g. when reading a null-terminated string.
-fn read_bytes_starting_at<'data>(elf_file: &ElfFile64<'data>, address: u64) -> Option<&'data [u8]> {
-    read_segment(elf_file, address).and_then(|data| match data {
-        Data::Bytes(bytes) => Some(bytes),
-        Data::Bss => None,
-    })
+fn read_bytes_starting_at<'data>(
+    elf_file: &ElfFile64<'data>,
+    address: u64,
+) -> Result<Option<&'data [u8]>> {
+    Ok(
+        read_segment(elf_file, address)?.and_then(|data| match data {
+            Data::Bytes(bytes) => Some(bytes),
+            Data::Bss => None,
+        }),
+    )
 }
 
 impl Display for SymbolName<'_> {
@@ -3615,6 +3688,15 @@ impl Display for SymtabEntryInfo<'_> {
             Visibility::Other(other) => write!(f, " (vis={other})")?,
         }
         Ok(())
+    }
+}
+
+impl Display for OutputKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutputKind::Executable => write!(f, "executable"),
+            OutputKind::SharedObject => write!(f, "shared-object"),
+        }
     }
 }
 

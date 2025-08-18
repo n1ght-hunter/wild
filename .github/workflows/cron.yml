@@ -12,7 +12,10 @@ jobs:
     if: github.repository_owner == 'davidlattimore'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - uses: gaurav-nelson/github-action-markdown-link-check@v1
+      - uses: umbrelladocs/action-linkspector@v1
+        with:
+          reporter: github-check
+          filter_mode: "nofilter"

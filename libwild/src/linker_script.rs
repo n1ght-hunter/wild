@@ -1,12 +1,12 @@
 //! This module is responsible for parsing linker scripts.
 
+use crate::alignment::Alignment;
 use crate::args::Input;
 use crate::args::InputSpec;
 use crate::args::Modifiers;
+use crate::error;
+use crate::error::Context as _;
 use crate::error::Result;
-use anyhow::Context;
-use anyhow::anyhow;
-use normalize_path::NormalizePath;
 use std::path::Path;
 use winnow::BStr;
 use winnow::Parser as _;
@@ -18,15 +18,21 @@ use winnow::combinator::eof;
 use winnow::combinator::opt;
 use winnow::combinator::repeat_till;
 use winnow::error::ContextError;
+use winnow::error::FromExternalError;
 use winnow::token::take_until;
 use winnow::token::take_while;
 
+/// Checks if we need to prefix `input_path` with the sysroot. If we do, then returns the resulting
+/// path. Otherwise, returns `None`. `linker_script_path` and `sysroot` should be canonical,
+/// absolute paths, otherwise we might not apply the sysroot when we actually should.
 pub(crate) fn maybe_apply_sysroot(
     linker_script_path: &Path,
     input_path: &Path,
     sysroot: &Path,
 ) -> Option<Box<Path>> {
-    if linker_script_path.normalize().starts_with(sysroot) {
+    debug_assert!(linker_script_path.is_absolute());
+    debug_assert!(sysroot.is_absolute());
+    if linker_script_path.starts_with(sysroot) {
         Some(Box::from(sysroot.join(input_path.strip_prefix("/").ok()?)))
     } else {
         maybe_forced_sysroot(input_path, sysroot)
@@ -65,6 +71,7 @@ pub(crate) struct Sections<'a> {
 pub(crate) enum SectionCommand<'a> {
     Section(Section<'a>),
     SetLocation(Location),
+    Align(Alignment),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -76,13 +83,14 @@ pub(crate) struct Location {
 pub(crate) struct Section<'a> {
     pub(crate) output_section_name: &'a [u8],
     pub(crate) commands: Vec<ContentsCommand<'a>>,
-    pub(crate) alignment: Option<u32>,
+    pub(crate) alignment: Option<Alignment>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ContentsCommand<'a> {
     Matcher(Matcher<'a>),
     SymbolAssignment(SymbolAssignment<'a>),
+    Align(Alignment),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -101,7 +109,7 @@ pub(crate) struct Matcher<'a> {
 impl<'data> LinkerScript<'data> {
     pub(crate) fn parse(bytes: &'data [u8], path: &Path) -> Result<LinkerScript<'data>> {
         let commands = parse_commands.parse(BStr::new(bytes)).map_err(|error| {
-            anyhow!(
+            error!(
                 "Failed to parse linker script `{}`:\n{error}",
                 path.display()
             )
@@ -124,10 +132,13 @@ fn parse_token<'input>(input: &mut &'input BStr) -> winnow::Result<&'input [u8]>
     take_while(1.., |b| !b" (){}\n\t".contains(&b)).parse_next(input)
 }
 
-fn skip_comments_and_whitespace(input: &mut &BStr) -> winnow::Result<()> {
+pub(crate) fn skip_comments_and_whitespace(input: &mut &BStr) -> winnow::Result<()> {
     loop {
         multispace0(input)?;
-        if input.starts_with(b"/*") {
+
+        if input.starts_with(b"#") {
+            take_until(1.., "\n").parse_next(input)?;
+        } else if input.starts_with(b"/*") {
             take_until(1.., "*/").parse_next(input)?;
             "*/".parse_next(input)?;
         } else {
@@ -165,17 +176,11 @@ fn parse_command<'input>(input: &mut &'input BStr) -> winnow::Result<Command<'in
     Ok(command)
 }
 
-fn parse_location_assignment(input: &mut &BStr) -> winnow::Result<Location> {
-    skip_comments_and_whitespace(input)?;
-    '='.parse_next(input)?;
-    skip_comments_and_whitespace(input)?;
+fn parse_location(input: &mut &BStr) -> winnow::Result<Location> {
     "0x".parse_next(input)?;
     let hex_str =
         std::str::from_utf8(hex_digit1.parse_next(input)?).map_err(|_| ContextError::new())?;
     let address = u64::from_str_radix(hex_str, 16).map_err(|_| ContextError::new())?;
-    skip_comments_and_whitespace(input)?;
-    ';'.parse_next(input)?;
-    skip_comments_and_whitespace(input)?;
     Ok(Location { address })
 }
 
@@ -208,13 +213,24 @@ fn parse_section_command<'input>(
 ) -> winnow::Result<SectionCommand<'input>> {
     let name = parse_token(input)?;
 
-    if name == b"." {
-        return Ok(SectionCommand::SetLocation(
-            parse_location_assignment.parse_next(input)?,
-        ));
-    }
-
     skip_comments_and_whitespace(input)?;
+
+    if name == b"." {
+        '='.parse_next(input)?;
+        skip_comments_and_whitespace(input)?;
+
+        let cmd = if input.starts_with(b"ALIGN") {
+            SectionCommand::Align(parse_alignment(input)?)
+        } else {
+            SectionCommand::SetLocation(parse_location.parse_next(input)?)
+        };
+
+        skip_comments_and_whitespace(input)?;
+        ';'.parse_next(input)?;
+        skip_comments_and_whitespace(input)?;
+
+        return Ok(cmd);
+    }
 
     ':'.parse_next(input)?;
 
@@ -223,14 +239,7 @@ fn parse_section_command<'input>(
     let mut alignment = None;
 
     while !input.starts_with("{".as_bytes()) {
-        "ALIGN".parse_next(input)?;
-        skip_comments_and_whitespace(input)?;
-        '('.parse_next(input)?;
-        skip_comments_and_whitespace(input)?;
-        alignment = Some(dec_uint.parse_next(input)?);
-        skip_comments_and_whitespace(input)?;
-        ')'.parse_next(input)?;
-        skip_comments_and_whitespace(input)?;
+        alignment = Some(parse_alignment.parse_next(input)?);
     }
 
     '{'.parse_next(input)?;
@@ -247,6 +256,21 @@ fn parse_section_command<'input>(
     }))
 }
 
+fn parse_alignment(input: &mut &BStr) -> winnow::Result<Alignment> {
+    "ALIGN".parse_next(input)?;
+    skip_comments_and_whitespace(input)?;
+    '('.parse_next(input)?;
+    skip_comments_and_whitespace(input)?;
+    let raw_alignment = dec_uint.parse_next(input)?;
+    let alignment = Alignment::new(raw_alignment).map_err(|_| {
+        ContextError::from_external_error(input, LinkerScriptError::InvalidAlignment)
+    })?;
+    skip_comments_and_whitespace(input)?;
+    ')'.parse_next(input)?;
+    skip_comments_and_whitespace(input)?;
+    Ok(alignment)
+}
+
 fn parse_contents_command<'input>(
     input: &mut &'input BStr,
 ) -> winnow::Result<ContentsCommand<'input>> {
@@ -258,10 +282,18 @@ fn parse_assignment<'input>(input: &mut &'input BStr) -> winnow::Result<Contents
     skip_comments_and_whitespace(input)?;
     '='.parse_next(input)?;
     skip_comments_and_whitespace(input)?;
-    '.'.parse_next(input)?;
+
+    let cmd = if name == b"." {
+        ContentsCommand::Align(parse_alignment(input)?)
+    } else {
+        '.'.parse_next(input)?;
+        ContentsCommand::SymbolAssignment(SymbolAssignment { name })
+    };
+
     opt(';').parse_next(input)?;
     skip_comments_and_whitespace(input)?;
-    Ok(ContentsCommand::SymbolAssignment(SymbolAssignment { name }))
+
+    Ok(cmd)
 }
 
 fn parse_matcher<'input>(input: &mut &'input BStr) -> winnow::Result<ContentsCommand<'input>> {
@@ -344,13 +376,28 @@ fn to_str(bytes: &[u8]) -> Result<&str> {
         .with_context(|| format!("Expected UTF-8, found `{}`", String::from_utf8_lossy(bytes)))
 }
 
+#[derive(Debug)]
+enum LinkerScriptError {
+    InvalidAlignment,
+}
+
+impl std::error::Error for LinkerScriptError {}
+
+impl std::fmt::Display for LinkerScriptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LinkerScriptError::InvalidAlignment => write!(f, "Invalid alignment"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::args::InputSpec;
     use itertools::assert_equal;
 
-    fn parse_script(text: &str) -> Result<LinkerScript> {
+    fn parse_script<'a>(text: &'a str) -> Result<LinkerScript<'a>> {
         LinkerScript::parse(text.as_bytes(), Path::new("test-linker-script.txt"))
     }
 
@@ -464,16 +511,6 @@ mod tests {
             ),
             Some(Box::from(sysroot.join("lib/libc.so.6"))),
         );
-        // Relative sysroot path
-        let relative_sysroot = Path::new("foo");
-        assert_equal(
-            maybe_apply_sysroot(
-                &relative_sysroot.join("lib/libc.so"),
-                Path::new("/lib/libc.so.6"),
-                relative_sysroot,
-            ),
-            Some(Box::from(relative_sysroot.join("lib/libc.so.6"))),
-        );
     }
 
     #[track_caller]
@@ -518,9 +555,11 @@ mod tests {
             ENTRY(_start)
             SECTIONS {
                 . = 0x1000000;
+                . = ALIGN(16);
                 .foo : ALIGN(8) {
                     start_foo = .;
                     KEEP(*(.rodata.foo));
+                    . = ALIGN(32);
                     end_foo = .;
                 }
             }
@@ -531,6 +570,7 @@ mod tests {
                     Command::Sections(Sections {
                         commands: vec![
                             SectionCommand::SetLocation(Location { address: 0x1000000 }),
+                            SectionCommand::Align(Alignment::new(16).unwrap()),
                             SectionCommand::Section(Section {
                                 output_section_name: ".foo".as_bytes(),
                                 commands: vec![
@@ -541,11 +581,12 @@ mod tests {
                                         must_keep: true,
                                         input_section_name_patterns: vec![".rodata.foo".as_bytes()],
                                     }),
+                                    ContentsCommand::Align(Alignment::new(32).unwrap()),
                                     ContentsCommand::SymbolAssignment(SymbolAssignment {
                                         name: "end_foo".as_bytes(),
                                     }),
                                 ],
-                                alignment: Some(8),
+                                alignment: Some(Alignment::new(8).unwrap()),
                             }),
                         ],
                     }),

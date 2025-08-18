@@ -15,13 +15,12 @@
 //! related to `part_id.rs` and insert later in `SECTION_DEFINITIONS` (probably at the end). Also,
 //! update `NUM_BUILT_IN_REGULAR_SECTIONS`.
 
-use self::elf::TLS_MODULE_BASE_SYMBOL_NAME;
 use crate::alignment;
 use crate::alignment::Alignment;
 use crate::alignment::NUM_ALIGNMENTS;
-use crate::args::OutputKind;
 use crate::elf;
 use crate::elf::DynamicEntry;
+use crate::elf::GLOBAL_POINTER_SYMBOL_NAME;
 use crate::elf::Versym;
 use crate::layout::NonAddressableCounts;
 use crate::layout::OutputRecordLayout;
@@ -99,6 +98,7 @@ pub(crate) const SYMTAB_GLOBAL: OutputSectionId = part_id::SYMTAB_GLOBAL.output_
 pub(crate) const RELA_DYN_RELATIVE: OutputSectionId =
     part_id::RELA_DYN_RELATIVE.output_section_id();
 pub(crate) const RELA_DYN_GENERAL: OutputSectionId = part_id::RELA_DYN_GENERAL.output_section_id();
+pub(crate) const RISCV_ATTRIBUTES: OutputSectionId = part_id::RISCV_ATTRIBUTES.output_section_id();
 
 pub(crate) const RODATA: OutputSectionId = OutputSectionId::regular(0);
 pub(crate) const INIT_ARRAY: OutputSectionId = OutputSectionId::regular(1);
@@ -276,13 +276,15 @@ struct CustomSectionIds {
     data: Vec<OutputSectionId>,
     bss: Vec<OutputSectionId>,
     nonalloc: Vec<OutputSectionId>,
+    tdata: Vec<OutputSectionId>,
+    tbss: Vec<OutputSectionId>,
 }
 
-impl OutputSections<'_> {
+impl<'data> OutputSections<'data> {
     /// Returns an iterator that emits all section IDs and their info.
     pub(crate) fn ids_with_info(
         &self,
-    ) -> impl Iterator<Item = (OutputSectionId, &SectionOutputInfo)> {
+    ) -> impl Iterator<Item = (OutputSectionId, &SectionOutputInfo<'data>)> {
         self.section_infos.iter()
     }
 
@@ -369,8 +371,8 @@ pub(crate) struct BuiltInSectionDetails {
     pub(crate) section_flags: SectionFlags,
     /// Sections to try to link to. The first section that we're outputting is the one used.
     pub(crate) link: &'static [OutputSectionId],
-    start_symbol_name: Option<&'static str>,
-    end_symbol_name: Option<&'static str>,
+    pub(crate) start_symbol_name: Option<&'static str>,
+    pub(crate) end_symbol_name: Option<&'static str>,
     pub(crate) min_alignment: Alignment,
     info_fn: Option<fn(&InfoInputs) -> u32>,
     pub(crate) keep_if_empty: bool,
@@ -378,28 +380,6 @@ pub(crate) struct BuiltInSectionDetails {
     pub(crate) ty: SectionType,
     is_relro: bool,
     target_segment_type: Option<SegmentType>,
-}
-
-impl BuiltInSectionDetails {
-    pub(crate) fn start_symbol_name(&self, output_kind: OutputKind) -> Option<&'static str> {
-        if self.start_symbol_name == Some(TLS_MODULE_BASE_SYMBOL_NAME)
-            && output_kind != OutputKind::SharedObject
-        {
-            None
-        } else {
-            self.start_symbol_name
-        }
-    }
-
-    pub(crate) fn end_symbol_name(&self, output_kind: OutputKind) -> Option<&'static str> {
-        if self.end_symbol_name == Some(TLS_MODULE_BASE_SYMBOL_NAME)
-            && output_kind == OutputKind::SharedObject
-        {
-            None
-        } else {
-            self.end_symbol_name
-        }
-    }
 }
 
 const DEFAULT_DEFS: BuiltInSectionDetails = BuiltInSectionDetails {
@@ -608,6 +588,11 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = [
         kind: SectionKind::Secondary(RELA_DYN_RELATIVE),
         ..DEFAULT_DEFS
     },
+    BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(RISCV_ATTRIBUTES_SECTION_NAME)),
+        ty: sht::RISCV_ATTRIBUTES,
+        ..DEFAULT_DEFS
+    },
     // Start of regular sections
     BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(RODATA_SECTION_NAME)),
@@ -638,9 +623,10 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = [
     BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(PREINIT_ARRAY_SECTION_NAME)),
         ty: sht::PREINIT_ARRAY,
-        section_flags: shf::ALLOC,
+        section_flags: shf::ALLOC.with(shf::WRITE),
         start_symbol_name: Some("__preinit_array_start"),
         end_symbol_name: Some("__preinit_array_end"),
+        is_relro: true,
         ..DEFAULT_DEFS
     },
     BuiltInSectionDetails {
@@ -665,21 +651,20 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = [
         kind: SectionKind::Primary(SectionName(DATA_SECTION_NAME)),
         ty: sht::PROGBITS,
         section_flags: shf::ALLOC.with(shf::WRITE),
+        // TODO: define the symbol only on RISC-V target
+        start_symbol_name: Some(GLOBAL_POINTER_SYMBOL_NAME),
         ..DEFAULT_DEFS
     },
     BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(TDATA_SECTION_NAME)),
         ty: sht::PROGBITS,
         section_flags: shf::WRITE.with(shf::ALLOC).with(shf::TLS),
-        // The symbol is defined twice, but later on we make a filtering based on the output type!
-        start_symbol_name: Some(TLS_MODULE_BASE_SYMBOL_NAME),
         ..DEFAULT_DEFS
     },
     BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(TBSS_SECTION_NAME)),
         ty: sht::NOBITS,
         section_flags: shf::WRITE.with(shf::ALLOC).with(shf::TLS),
-        end_symbol_name: Some(TLS_MODULE_BASE_SYMBOL_NAME),
         ..DEFAULT_DEFS
     },
     BuiltInSectionDetails {
@@ -869,7 +854,6 @@ impl CustomSectionIds {
         builder.add_section(RODATA);
         builder.add_section(EH_FRAME_HDR);
         builder.add_section(EH_FRAME);
-        builder.add_section(PREINIT_ARRAY);
         builder.add_section(GCC_EXCEPT_TABLE);
         builder.add_sections(&self.ro);
 
@@ -880,9 +864,12 @@ impl CustomSectionIds {
         builder.add_sections(&self.exec);
 
         builder.add_section(TDATA);
+        builder.add_sections(&self.tdata);
         builder.add_section(TBSS);
+        builder.add_sections(&self.tbss);
         builder.add_section(INIT_ARRAY);
         builder.add_section(FINI_ARRAY);
+        builder.add_section(PREINIT_ARRAY);
         builder.add_section(DATA_REL_RO);
         builder.add_section(DYNAMIC);
         builder.add_section(GOT);
@@ -893,6 +880,7 @@ impl CustomSectionIds {
 
         builder.add_sections(&self.nonalloc);
         builder.add_section(COMMENT);
+        builder.add_section(RISCV_ATTRIBUTES);
         builder.add_section(SHSTRTAB);
         builder.add_section(SYMTAB_LOCAL);
         builder.add_section(SYMTAB_GLOBAL);
@@ -937,12 +925,16 @@ impl<'data> OutputSections<'data> {
         })
     }
 
-    pub(crate) fn add_secondary_section(&mut self, primary_id: OutputSectionId) -> OutputSectionId {
+    pub(crate) fn add_secondary_section(
+        &mut self,
+        primary_id: OutputSectionId,
+        min_alignment: Alignment,
+    ) -> OutputSectionId {
         self.section_infos.add_new(SectionOutputInfo {
             kind: SectionKind::Secondary(primary_id),
             section_flags: SectionFlags::empty(),
             ty: SectionType::from_u32(0),
-            min_alignment: alignment::MIN,
+            min_alignment,
             entsize: 0,
             location: None,
         })
@@ -980,6 +972,12 @@ impl<'data> OutputSections<'data> {
 
             if info.section_flags.contains(shf::EXECINSTR) {
                 custom.exec.push(id);
+            } else if info.section_flags.contains(shf::TLS) {
+                if info.ty == sht::NOBITS {
+                    custom.tbss.push(id);
+                } else {
+                    custom.tdata.push(id);
+                }
             } else if !info.section_flags.contains(shf::WRITE) {
                 if info.section_flags.contains(shf::ALLOC) {
                     custom.ro.push(id);
@@ -1008,12 +1006,15 @@ impl<'data> OutputSections<'data> {
     }
 
     pub(crate) fn has_data_in_file(&self, section_id: OutputSectionId) -> bool {
-        // Note, we treat TBSS as having data in the file, even though it's a NOBITS section. This
-        // allows us to more easily place TBSS before other PROGBITS sections. Effectively TBSS is
-        // NOBITS, but we put zero padding of the same size in the file. GNU ld doesn't do this. It
-        // instead puts TBSS and the subsequent section at the same address.
+        // Note, we treat TLS sections (e.g. .tbss) as having data in the file, even if they're
+        // NOBITS. This allows us to more easily place .tbss before other PROGBITS sections.
+        // Effectively .tbss is NOBITS, but we put zero padding of the same size in the file. GNU ld
+        // doesn't do this. It instead puts .tbss and the subsequent section at the same address.
         self.output_info(section_id).ty != sht::NOBITS
-            || section_id == crate::output_section_id::TBSS
+            || self
+                .output_info(section_id)
+                .section_flags
+                .contains(shf::TLS)
     }
 
     pub(crate) fn output_info(&self, id: OutputSectionId) -> &SectionOutputInfo<'data> {
@@ -1230,6 +1231,7 @@ fn test_constant_ids() {
         (DYNSTR, DYNSTR_SECTION_NAME),
         (RELA_DYN_RELATIVE, RELA_DYN_SECTION_NAME),
         (RELA_DYN_GENERAL, &[]),
+        (RISCV_ATTRIBUTES, RISCV_ATTRIBUTES_SECTION_NAME),
         (GCC_EXCEPT_TABLE, GCC_EXCEPT_TABLE_SECTION_NAME),
         (INTERP, INTERP_SECTION_NAME),
         (GNU_VERSION, GNU_VERSION_SECTION_NAME),
@@ -1247,7 +1249,7 @@ fn test_constant_ids() {
     for (id, name) in check {
         match id.built_in_details().kind {
             SectionKind::Primary(section_name) => {
-                assert_eq!(section_name.bytes(), *name);
+                assert_eq!(section_name.to_string(), String::from_utf8_lossy(name));
             }
             SectionKind::Secondary(_) => assert!(name.is_empty()),
         }

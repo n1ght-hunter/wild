@@ -43,6 +43,7 @@ mod gnu_hash;
 mod header_diff;
 mod init_order;
 pub(crate) mod section_map;
+mod segment;
 mod symbol_diff;
 mod symtab;
 mod trace;
@@ -152,6 +153,7 @@ impl Config {
                 "section.note.gnu.property",
                 "section.note.stapsdt",
                 "section.hash",
+                "section.sframe",
                 // We set this to 8. GNU ld sometimes does too, but sometimes to 0.
                 "section.got.entsize",
                 "section.plt.got.entsize",
@@ -216,6 +218,7 @@ impl Config {
                 // address is known and within +/-1MB. We don't as yet.
                 "rel.missing-opt.R_AARCH64_ADR_GOT_PAGE.AdrpToAdr.*",
                 "rel.missing-opt.R_AARCH64_ADR_PREL_PG_HI21.AdrpToAdr.*",
+                "rel.extra-opt.R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21.MovzXnLsl16.*",
                 // The other linkers set properties on sections if all input sections have that
                 // property. For sections like .rodata, this seems like an unimportant behaviour to
                 // replicate.
@@ -234,21 +237,51 @@ impl Config {
                 // If we don't optimise a TLS access, then we'll have references to __tls_get_addr,
                 // when GNU ld doesn't.
                 "dynsym.__tls_get_addr.*",
+                // GNU ld emits two segments, whereas wild emits only a single segment.
+                "segment.LOAD.R.*",
+                // We haven't provided an implementation that is compatible with existing linkers.
+                "segment.PT_NOTE.*",
+                "segment.PT_INTERP.*",
+                "segment.PT_PHDR.*",
+                "segment.PT_GNU_RELRO.*",
+                "segment.PT_GNU_STACK.*",
+                "segment.PT_GNU_PROPERTY.*",
+                "segment.PT_GNU_SFRAME.*",
+                // TODO: RISC-v
+                "segment.SHT_RISCV_ATTRIBUTES.*",
+                "segment.LOAD.RW.alignment",
             ]
             .into_iter()
             .map(ToOwned::to_owned),
         );
 
-        if arch == ArchKind::Aarch64 {
-            self.ignore.extend(
+        match arch {
+            ArchKind::Aarch64 => self.ignore.extend(
                 [
                     // Other linkers have a bigger initial PLT entry, thus the entsize is set to zero:
                     // https://sourceware.org/bugzilla/show_bug.cgi?id=26312
                     "section.plt.entsize",
+                    // On Alpine Linux, aarch64, GNU ld seems to emit the _DYNAMIC symbol without a
+                    // section index instead of pointing it at the .dynamic section.
+                    "rel.extra-symbol._DYNAMIC",
+                    // Also on Alpine Linux, aarch64, it seems that GNU ld is emitting an
+                    // unnecessary GLOB_DAT relocation in a GOT entry.
+                    "rel.missing-got-dynamic.executable",
                 ]
                 .into_iter()
                 .map(ToOwned::to_owned),
-            );
+            ),
+            ArchKind::RISCV64 => self.ignore.extend(
+                [
+                    // TODO: for some reason, main is put into .dynsym
+                    "dynsym.main.section",
+                    // #701
+                    "file-header.flags",
+                ]
+                .into_iter()
+                .map(ToOwned::to_owned),
+            ),
+            ArchKind::X86_64 => {}
         }
 
         self.equiv.push((
@@ -346,7 +379,11 @@ impl<'data> Binary<'data> {
 
     /// Looks up a symbol, first trying to get a global, or failing that a local. If multiple
     /// symbols have the same name, then `hint_address` is used to select which one to return.
-    pub(crate) fn symbol_by_name(&self, name: &[u8], hint_address: u64) -> NameLookupResult {
+    pub(crate) fn symbol_by_name<'file: 'data>(
+        &'file self,
+        name: &[u8],
+        hint_address: u64,
+    ) -> NameLookupResult<'data, 'file> {
         match self.lookup_symbol(&self.name_index.globals_by_name, name, hint_address) {
             NameLookupResult::Undefined => {
                 self.lookup_symbol(&self.name_index.locals_by_name, name, hint_address)
@@ -355,20 +392,20 @@ impl<'data> Binary<'data> {
         }
     }
 
-    fn lookup_symbol(
-        &self,
+    fn lookup_symbol<'file: 'data>(
+        &'file self,
         symbol_map: &HashMap<&[u8], Vec<object::SymbolIndex>>,
         name: &[u8],
         hint_address: u64,
-    ) -> NameLookupResult {
+    ) -> NameLookupResult<'data, 'file> {
         let indexes = symbol_map.get(name).map(Vec::as_slice).unwrap_or_default();
 
         if indexes.len() >= 2 {
             for sym_index in indexes {
-                if let Ok(sym) = self.elf_file.symbol_by_index(*sym_index) {
-                    if sym.address() == hint_address {
-                        return NameLookupResult::Defined(sym);
-                    }
+                if let Ok(sym) = self.elf_file.symbol_by_index(*sym_index)
+                    && sym.address() == hint_address
+                {
+                    return NameLookupResult::Defined(sym);
                 }
             }
 
@@ -387,16 +424,25 @@ impl<'data> Binary<'data> {
         }
     }
 
-    fn section_by_name(&self, name: &str) -> Option<ElfSection64<LittleEndian>> {
+    fn section_by_name<'file: 'data>(
+        &'file self,
+        name: &str,
+    ) -> Option<ElfSection64<'data, 'file, LittleEndian>> {
         self.section_by_name_bytes(name.as_bytes())
     }
 
-    fn section_by_name_bytes(&self, name: &[u8]) -> Option<ElfSection64<LittleEndian>> {
+    fn section_by_name_bytes<'file: 'data>(
+        &'file self,
+        name: &[u8],
+    ) -> Option<ElfSection64<'data, 'file, LittleEndian>> {
         let index = self.sections_by_name.get(name)?.index;
         self.elf_file.section_by_index(index).ok()
     }
 
-    fn section_containing_address(&self, address: u64) -> Option<ElfSection64<LittleEndian>> {
+    fn section_containing_address<'file: 'data>(
+        &'file self,
+        address: u64,
+    ) -> Option<ElfSection64<'file, 'data, LittleEndian>> {
         self.elf_file
             .sections()
             .find(|sec| (sec.address()..sec.address() + sec.size()).contains(&address))
@@ -518,6 +564,10 @@ impl Report {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        if objects.len() < 2 {
+            bail!("At least two files must be provided for comparison");
+        }
+
         let arch = ArchKind::from_objects(&objects)?;
 
         if config.wild_defaults {
@@ -570,6 +620,7 @@ impl Report {
         version_diff::report_diffs(self, objects);
         debug_info_diff::check_debug_info(self, objects);
         symbol_diff::report_diffs(self, objects);
+        segment::report_diffs(self, objects);
 
         match arch {
             ArchKind::X86_64 => {
@@ -577,6 +628,10 @@ impl Report {
             }
             ArchKind::Aarch64 => {
                 self.report_arch_specific_diffs::<crate::aarch64::AArch64>(objects);
+            }
+
+            ArchKind::RISCV64 => {
+                // TODO
             }
         }
     }

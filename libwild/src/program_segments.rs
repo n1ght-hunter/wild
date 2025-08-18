@@ -77,6 +77,10 @@ impl ProgramSegmentDef {
     pub(crate) fn is_executable(self) -> bool {
         self.segment_flags.contains(pf::EXECUTABLE)
     }
+
+    pub(crate) fn always_keep(self) -> bool {
+        self.segment_type == pt::PHDR
+    }
 }
 
 impl ProgramSegments {
@@ -139,6 +143,10 @@ impl ProgramSegments {
 
         (type_pos, mem_start)
     }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = ProgramSegmentDef> {
+        self.program_segment_details.iter().copied()
+    }
 }
 
 impl ProgramSegmentId {
@@ -154,7 +162,10 @@ impl ProgramSegmentId {
         )
     }
 
-    pub(crate) fn display(self, program_segments: &ProgramSegments) -> ProgramSegmentDisplay {
+    pub(crate) fn display<'a>(
+        self,
+        program_segments: &'a ProgramSegments,
+    ) -> ProgramSegmentDisplay<'a> {
         ProgramSegmentDisplay {
             id: self,
             program_segments,

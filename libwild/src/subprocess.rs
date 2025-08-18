@@ -1,13 +1,12 @@
 use crate::Args;
+use crate::bail;
+use crate::error::Context as _;
 use crate::error::Result;
-use anyhow::Context as _;
-use anyhow::anyhow;
 use libc::c_char;
 use libc::fork;
 use libc::pid_t;
 use std::ffi::c_int;
 use std::ffi::c_void;
-use std::io::Error;
 
 /// Runs the linker, in a subprocess if possible, prints any errors, then exits.
 ///
@@ -21,18 +20,15 @@ use std::io::Error;
 /// # Safety
 /// Must not be called once threads have been spawned. Calling this function from main is generally
 /// the best way to ensure this.
-pub unsafe fn run_in_subprocess(args: &Args) -> ! {
+pub unsafe fn run_in_subprocess(args: Args) -> ! {
     let exit_code = match subprocess_result(args) {
         Ok(code) => code,
-        Err(error) => {
-            eprintln!("Error: {error:?}");
-            -1
-        }
+        Err(error) => crate::error::report_error_and_exit(&error),
     };
     std::process::exit(exit_code);
 }
 
-fn subprocess_result(args: &Args) -> Result<i32> {
+fn subprocess_result(args: Args) -> Result<i32> {
     let mut fds: [c_int; 2] = [0; 2];
     // create the pipe used to communicate between the parent and child processes - exit on failure
     make_pipe(&mut fds).context("make_pipe")?;
@@ -43,15 +39,17 @@ fn subprocess_result(args: &Args) -> Result<i32> {
     match unsafe { fork() } {
         0 => {
             // Fork success in child - Run linker in this process.
-            crate::setup_tracing(args)?;
-            crate::setup_thread_pool(args)?;
+
+            crate::setup_tracing(&args)?;
+            let args = args.activate_thread_pool()?;
             let linker = crate::Linker::new();
-            let _outputs = linker.run(args)?;
+            let _outputs = linker.run(&args)?;
             inform_parent_done(&fds);
             Ok(0)
         }
         -1 => {
             // Fork failure in the parent - Fallback to running linker in this process
+
             crate::run(args)?;
             Ok(0)
         }
@@ -110,9 +108,9 @@ fn wait_for_child_done(fds: &[c_int], child_pid: pid_t) -> i32 {
 fn make_pipe(fds: &mut [c_int; 2]) -> Result {
     match unsafe { libc::pipe(fds.as_mut_ptr()) } {
         0 => Ok(()),
-        _ => Err(anyhow!(
+        _ => bail!(
             "Error creating pipe. Errno = {:?}",
-            Error::last_os_error().raw_os_error().unwrap_or(-1)
-        )),
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        ),
     }
 }

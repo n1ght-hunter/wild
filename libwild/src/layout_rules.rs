@@ -2,12 +2,11 @@
 
 use crate::OutputSections;
 use crate::alignment;
-use crate::alignment::Alignment;
+use crate::ensure;
 use crate::error::Result;
 use crate::hash::hash_bytes;
 use crate::input_data::InputLinkerScript;
 use crate::input_data::InputRef;
-use crate::input_data::UNINITIALISED_FILE_ID;
 use crate::linker_script;
 use crate::linker_script::ContentsCommand;
 use crate::linker_script::SectionCommand;
@@ -16,16 +15,14 @@ use crate::output_section_id::OutputSectionId;
 use crate::output_section_id::SectionName;
 use crate::parsing::InternalSymDefInfo;
 use crate::parsing::ProcessedLinkerScript;
-use crate::symbol::UnversionedSymbolName;
-use crate::symbol_db::SymbolId;
-use crate::symbol_db::SymbolIdRange;
-use anyhow::ensure;
+use crate::parsing::SymbolPlacement;
 use hashbrown::HashTable;
 use linker_utils::elf::SectionFlags;
 use linker_utils::elf::SectionType;
 use linker_utils::elf::secnames;
 use linker_utils::elf::shf;
 use linker_utils::elf::sht;
+use std::mem::replace;
 
 pub(crate) struct LayoutRules<'data> {
     pub(crate) section_rules: SectionRules<'data>,
@@ -75,6 +72,7 @@ pub(crate) enum SectionRuleOutcome {
     EhFrame,
     NoteGnuProperty,
     Debug,
+    RiscVAttribute,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,21 +104,28 @@ impl<'data> LayoutRulesBuilder<'data> {
         input: &InputLinkerScript<'data>,
         output_sections: &mut OutputSections<'data>,
     ) -> Result<ProcessedLinkerScript<'data>> {
-        let mut symbol_names = Vec::new();
         let mut symbol_defs = Vec::new();
 
         for cmd in &input.script.commands {
             if let linker_script::Command::Sections(sections) = cmd {
                 let mut location = None;
 
+                // "Extra alignment" is what we call it when a linker script sets alignment via a
+                // command like `. = ALIGN(8)`. We attach that to the subsequent section by
+                // adjusting its alignment. This doesn't exactly match what GNU ld does, since what
+                // we do can cause the alignment of the section in the section headers to increase,
+                // whereas GNU ld leaves the section header alignment alone in this case. For now,
+                // though, it doesn't seem worthwhile having two separate alignment properties on a
+                // section, one of which doesn't affect the header value.
+                let mut extra_min_alignment = alignment::MIN;
+
                 for sec_cmd in &sections.commands {
                     match sec_cmd {
                         SectionCommand::Section(sec) => {
                             let min_alignment = sec
                                 .alignment
-                                .map(|alignment| Alignment::new(u64::from(alignment)))
-                                .transpose()?
-                                .unwrap_or(alignment::MIN);
+                                .unwrap_or(alignment::MIN)
+                                .max(replace(&mut extra_min_alignment, alignment::MIN));
 
                             let primary_section_id = output_sections.add_named_section(
                                 SectionName(sec.output_section_name),
@@ -136,8 +141,10 @@ impl<'data> LayoutRulesBuilder<'data> {
                                         let section_id = if last_section_id.is_none() {
                                             primary_section_id
                                         } else {
-                                            output_sections
-                                                .add_secondary_section(primary_section_id)
+                                            output_sections.add_secondary_section(
+                                                primary_section_id,
+                                                replace(&mut extra_min_alignment, alignment::MIN),
+                                            )
                                         };
 
                                         for pattern in &matcher.input_section_name_patterns {
@@ -155,34 +162,35 @@ impl<'data> LayoutRulesBuilder<'data> {
                                         last_section_id = Some(section_id);
                                     }
                                     ContentsCommand::SymbolAssignment(assignment) => {
-                                        symbol_names
-                                            .push(UnversionedSymbolName::new(assignment.name));
                                         symbol_defs.push(if let Some(id) = last_section_id {
-                                            InternalSymDefInfo::SectionEnd(id)
+                                            InternalSymDefInfo::notype(
+                                                SymbolPlacement::SectionEnd(id),
+                                                assignment.name,
+                                            )
                                         } else {
-                                            InternalSymDefInfo::SectionStart(primary_section_id)
+                                            InternalSymDefInfo::notype(
+                                                SymbolPlacement::SectionStart(primary_section_id),
+                                                assignment.name,
+                                            )
                                         });
                                     }
+                                    ContentsCommand::Align(a) => extra_min_alignment = *a,
                                 }
                             }
                         }
                         SectionCommand::SetLocation(new_location) => location = Some(*new_location),
+                        SectionCommand::Align(a) => extra_min_alignment = *a,
                     }
                 }
             }
         }
 
-        let symbol_id_range = SymbolIdRange::input(SymbolId::undefined(), symbol_names.len());
-
         Ok(ProcessedLinkerScript {
-            symbol_names,
             symbol_defs,
             input: InputRef {
                 file: input.input_file,
                 entry: None,
             },
-            file_id: UNINITIALISED_FILE_ID,
-            symbol_id_range,
         })
     }
 
@@ -343,6 +351,10 @@ const BUILT_IN_RULES: &[SectionRule<'static>] = &[
         secnames::NOTE_GNU_PROPERTY_SECTION_NAME,
         SectionRuleOutcome::NoteGnuProperty,
     ),
+    SectionRule::exact(
+        secnames::RISCV_ATTRIBUTES_SECTION_NAME,
+        SectionRuleOutcome::RiscVAttribute,
+    ),
     SectionRule::prefix(b".debug_", SectionRuleOutcome::Debug),
 ];
 
@@ -377,10 +389,10 @@ impl<'data> SectionRules<'data> {
         section_flags: SectionFlags,
         sh_type: SectionType,
     ) -> SectionRuleOutcome {
-        if let Some(hash) = section_name_prefix_hash(section_name) {
-            if let Some(rule) = self.rules.find(hash, |rule| rule.matches(section_name)) {
-                return rule.outcome;
-            }
+        if let Some(hash) = section_name_prefix_hash(section_name)
+            && let Some(rule) = self.rules.find(hash, |rule| rule.matches(section_name))
+        {
+            return rule.outcome;
         }
 
         if section_name.is_empty() {

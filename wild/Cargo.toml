@@ -12,7 +12,8 @@ name = "wild"
 path = "src/main.rs"
 
 [dependencies]
-libwild = { path = "../libwild", version = "0.4.0" }
+libwild = { path = "../libwild", version = "0.5.0" }
+jobserver = { workspace = true }
 
 # This is off by default, since it doesn't appear to help. However, if you're linking against musl
 # libc, which has a comparatively slow allocator, then enabling this does help. To enable this,
@@ -41,3 +42,7 @@ which = { workspace = true }
 default = ["fork"]
 
 fork = ["libwild/fork"]
+
+# external tests
+external_tests = ["mold_tests"]
+mold_tests = []

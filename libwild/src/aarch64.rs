@@ -1,19 +1,23 @@
 use crate::arch::Arch;
 use crate::elf::PLT_ENTRY_SIZE;
-use anyhow::Result;
-use anyhow::anyhow;
+use crate::ensure;
+use crate::error;
+use crate::error::Result;
+use crate::layout::Layout;
+use crate::layout::PropertyClass;
 use linker_utils::aarch64::DEFAULT_AARCH64_PAGE_IGNORED_MASK;
 use linker_utils::aarch64::DEFAULT_AARCH64_PAGE_MASK;
 use linker_utils::aarch64::DEFAULT_AARCH64_PAGE_SIZE;
 use linker_utils::aarch64::RelaxationKind;
 use linker_utils::aarch64::relocation_type_from_raw;
+use linker_utils::elf::AArch64Instruction;
 use linker_utils::elf::DynamicRelocationKind;
-use linker_utils::elf::RelocationInstruction;
 use linker_utils::elf::RelocationKind;
 use linker_utils::elf::RelocationKindInfo;
 use linker_utils::elf::aarch64_rel_type_to_string;
 use linker_utils::elf::shf;
 use linker_utils::relaxation::RelocationModifier;
+use object::elf::GNU_PROPERTY_AARCH64_FEATURE_1_AND;
 
 pub(crate) struct AArch64;
 
@@ -40,7 +44,7 @@ impl crate::arch::Arch for AArch64 {
     #[inline(always)]
     fn relocation_from_raw(r_type: u32) -> Result<RelocationKindInfo> {
         linker_utils::aarch64::relocation_type_from_raw(r_type).ok_or_else(|| {
-            anyhow!(
+            error!(
                 "Unsupported relocation type {}",
                 Self::rel_type_to_string(r_type)
             )
@@ -67,14 +71,14 @@ impl crate::arch::Arch for AArch64 {
         plt_entry.copy_from_slice(PLT_ENTRY_TEMPLATE);
         let plt_page_address = plt_address & DEFAULT_AARCH64_PAGE_IGNORED_MASK;
         let offset = got_address.wrapping_sub(plt_page_address);
-        anyhow::ensure!(offset < (1 << 32), "PLT is more than 4GiB away from GOT");
-        RelocationInstruction::Adr.write_to_value(
+        ensure!(offset < (1 << 32), "PLT is more than 4GiB away from GOT");
+        AArch64Instruction::Adr.write_to_value(
             // The immediate value represents a distance in pages.
             offset / DEFAULT_AARCH64_PAGE_SIZE,
             false,
             &mut plt_entry[0..4],
         );
-        RelocationInstruction::LdrRegister.write_to_value(
+        AArch64Instruction::LdrRegister.write_to_value(
             // The immediate offset is scaled by 8 as we are loading 8 bytes.
             (offset & DEFAULT_AARCH64_PAGE_MASK) / 8,
             false,
@@ -82,12 +86,32 @@ impl crate::arch::Arch for AArch64 {
         );
         Ok(())
     }
+
+    fn local_symbols_in_debug_info() -> bool {
+        false
+    }
+
+    fn tp_offset_start(layout: &Layout<'_>) -> u64 {
+        layout.tls_start_address_aarch64()
+    }
+
+    fn get_property_class(property_type: u32) -> Option<PropertyClass> {
+        match property_type {
+            GNU_PROPERTY_AARCH64_FEATURE_1_AND => Some(PropertyClass::And),
+            _ => None,
+        }
+    }
+
+    fn merge_eflags(_eflags: &[u32]) -> Result<u32> {
+        Ok(0)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct Relaxation {
     kind: RelaxationKind,
     rel_info: RelocationKindInfo,
+    mandatory: bool,
 }
 
 const TLSDESC_ADR_PAGE21_INSN_SEQUENCE: &[u8] = &[
@@ -97,6 +121,12 @@ const TLSDESC_ADR_PAGE21_INSN_SEQUENCE: &[u8] = &[
 const TLSDESC_ADD_LO12_INSN_SEQUENCE: &[u8] = &[
     0x0, 0x0, 0x0, 0x91, // add     x0, x0, #0x0
 ];
+
+macro_rules! rel_info_from_type {
+    ($r_type:expr) => {
+        const { relocation_type_from_raw($r_type).unwrap() }
+    };
+}
 
 impl crate::arch::Relaxation for Relaxation {
     #[allow(unused_variables)]
@@ -124,6 +154,7 @@ impl crate::arch::Relaxation for Relaxation {
                     return Some(Relaxation {
                         kind: RelaxationKind::NoOp,
                         rel_info: relocation,
+                        mandatory: true,
                     });
                 }
                 _ => None,
@@ -137,24 +168,24 @@ impl crate::arch::Relaxation for Relaxation {
         }
 
         let offset = offset_in_section as usize;
-        // TODO: Try fetching the symbol kind lazily. For most relocation, we don't need it, but
-        // because fetching it contains potential error paths, the optimiser probably can't optimise
-        // away fetching it.
 
         match relocation_kind {
             object::elf::R_AARCH64_CALL26 | object::elf::R_AARCH64_JUMP26 if !interposable => {
-                if non_zero_address {
+                return if non_zero_address {
                     relocation.kind = RelocationKind::Relative;
-                    return Some(Relaxation {
+                    Some(Relaxation {
                         kind: RelaxationKind::NoOp,
                         rel_info: relocation,
-                    });
-                }
-                // GNU ld replaces: 'bl 0' with 'nop'
-                return Some(Relaxation {
-                    kind: RelaxationKind::ReplaceWithNop,
-                    rel_info: relocation_type_from_raw(object::elf::R_AARCH64_NONE).unwrap(),
-                });
+                        mandatory: output_kind.is_static_executable(),
+                    })
+                } else {
+                    // GNU ld replaces: 'bl 0' with 'nop'
+                    Some(Relaxation {
+                        kind: RelaxationKind::ReplaceWithNop,
+                        rel_info: rel_info_from_type!(object::elf::R_AARCH64_NONE),
+                        mandatory: output_kind.is_static_executable(),
+                    })
+                };
             }
 
             object::elf::R_AARCH64_TLSDESC_ADR_PAGE21
@@ -166,7 +197,8 @@ impl crate::arch::Relaxation for Relaxation {
                 );
                 return Some(Relaxation {
                     kind: RelaxationKind::ReplaceWithNop,
-                    rel_info: relocation_type_from_raw(object::elf::R_AARCH64_NONE).unwrap(),
+                    rel_info: rel_info_from_type!(object::elf::R_AARCH64_NONE),
+                    mandatory: output_kind.is_static_executable(),
                 });
             }
             object::elf::R_AARCH64_TLSDESC_LD64_LO12
@@ -174,7 +206,8 @@ impl crate::arch::Relaxation for Relaxation {
             {
                 return Some(Relaxation {
                     kind: RelaxationKind::ReplaceWithNop,
-                    rel_info: relocation_type_from_raw(object::elf::R_AARCH64_NONE).unwrap(),
+                    rel_info: rel_info_from_type!(object::elf::R_AARCH64_NONE),
+                    mandatory: output_kind.is_static_executable(),
                 });
             }
             object::elf::R_AARCH64_TLSDESC_ADD_LO12
@@ -186,17 +219,15 @@ impl crate::arch::Relaxation for Relaxation {
                 );
                 return Some(Relaxation {
                     kind: RelaxationKind::MovzX0Lsl16,
-                    rel_info: relocation_type_from_raw(object::elf::R_AARCH64_TLSLE_MOVW_TPREL_G1)
-                        .unwrap(),
+                    rel_info: rel_info_from_type!(object::elf::R_AARCH64_TLSLE_MOVW_TPREL_G1),
+                    mandatory: output_kind.is_static_executable(),
                 });
             }
             object::elf::R_AARCH64_TLSDESC_CALL if output_kind.is_executable() && !interposable => {
                 return Some(Relaxation {
                     kind: RelaxationKind::MovkX0,
-                    rel_info: relocation_type_from_raw(
-                        object::elf::R_AARCH64_TLSLE_MOVW_TPREL_G0_NC,
-                    )
-                    .unwrap(),
+                    rel_info: rel_info_from_type!(object::elf::R_AARCH64_TLSLE_MOVW_TPREL_G0_NC),
+                    mandatory: output_kind.is_static_executable(),
                 });
             }
 
@@ -208,13 +239,15 @@ impl crate::arch::Relaxation for Relaxation {
                 );
                 return Some(Relaxation {
                     kind: RelaxationKind::ReplaceWithNop,
-                    rel_info: relocation_type_from_raw(object::elf::R_AARCH64_NONE).unwrap(),
+                    rel_info: rel_info_from_type!(object::elf::R_AARCH64_NONE),
+                    mandatory: output_kind.is_static_executable(),
                 });
             }
             object::elf::R_AARCH64_TLSDESC_LD64_LO12 if output_kind.is_executable() => {
                 return Some(Relaxation {
                     kind: RelaxationKind::ReplaceWithNop,
-                    rel_info: relocation_type_from_raw(object::elf::R_AARCH64_NONE).unwrap(),
+                    rel_info: rel_info_from_type!(object::elf::R_AARCH64_NONE),
+                    mandatory: output_kind.is_static_executable(),
                 });
             }
             object::elf::R_AARCH64_TLSDESC_ADD_LO12 if output_kind.is_executable() => {
@@ -224,19 +257,17 @@ impl crate::arch::Relaxation for Relaxation {
                 );
                 return Some(Relaxation {
                     kind: RelaxationKind::AdrpX0,
-                    rel_info: relocation_type_from_raw(
-                        object::elf::R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21,
-                    )
-                    .unwrap(),
+                    rel_info: rel_info_from_type!(object::elf::R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21),
+                    mandatory: output_kind.is_static_executable(),
                 });
             }
             object::elf::R_AARCH64_TLSDESC_CALL if output_kind.is_executable() => {
                 return Some(Relaxation {
                     kind: RelaxationKind::LdrX0,
-                    rel_info: relocation_type_from_raw(
-                        object::elf::R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC,
-                    )
-                    .unwrap(),
+                    rel_info: rel_info_from_type!(
+                        object::elf::R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC
+                    ),
+                    mandatory: output_kind.is_static_executable(),
                 });
             }
 
@@ -245,8 +276,8 @@ impl crate::arch::Relaxation for Relaxation {
             {
                 return Some(Relaxation {
                     kind: RelaxationKind::MovzXnLsl16,
-                    rel_info: relocation_type_from_raw(object::elf::R_AARCH64_TLSLE_MOVW_TPREL_G1)
-                        .unwrap(),
+                    rel_info: rel_info_from_type!(object::elf::R_AARCH64_TLSLE_MOVW_TPREL_G1),
+                    mandatory: false,
                 });
             }
             object::elf::R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC
@@ -254,10 +285,8 @@ impl crate::arch::Relaxation for Relaxation {
             {
                 return Some(Relaxation {
                     kind: RelaxationKind::MovkXn,
-                    rel_info: relocation_type_from_raw(
-                        object::elf::R_AARCH64_TLSLE_MOVW_TPREL_G0_NC,
-                    )
-                    .unwrap(),
+                    rel_info: rel_info_from_type!(object::elf::R_AARCH64_TLSLE_MOVW_TPREL_G0_NC),
+                    mandatory: false,
                 });
             }
 
@@ -281,5 +310,9 @@ impl crate::arch::Relaxation for Relaxation {
 
     fn next_modifier(&self) -> RelocationModifier {
         self.kind.next_modifier()
+    }
+
+    fn is_mandatory(&self) -> bool {
+        self.mandatory
     }
 }

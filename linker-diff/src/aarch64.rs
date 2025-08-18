@@ -2,12 +2,14 @@ use crate::arch::Arch;
 use crate::arch::Instruction;
 use crate::arch::Relaxation;
 use crate::arch::RelaxationByteRange;
+use crate::asm_diff::BasicValueKind;
 use anyhow::Context;
 use anyhow::Result;
 use itertools::Itertools;
 use linker_utils::aarch64::DEFAULT_AARCH64_PAGE_IGNORED_MASK;
 use linker_utils::aarch64::DEFAULT_AARCH64_PAGE_SIZE_BITS;
 use linker_utils::aarch64::RelaxationKind;
+use linker_utils::elf::AArch64Instruction;
 use linker_utils::elf::BitMask;
 use linker_utils::elf::DynamicRelocationKind;
 use linker_utils::elf::PageMask;
@@ -64,7 +66,7 @@ fn decode_insn_with_objdump(insn: &[u8], address: u64) -> Result<String> {
         .skip(2)
         .join(" ")
         .replacen(" ", "\t", 1)
-        .to_string())
+        .clone())
 }
 
 #[test]
@@ -73,7 +75,7 @@ fn test_align_up() {
     // so we only check that we can disassemble if we're running on aarch64 or if test
     // cross-compilation is enabled.
     if cfg!(target_arch = "aarch64")
-        || std::env::var("WILD_TEST_CROSS").is_ok_and(|v| v == "aarch64")
+        || std::env::var("WILD_TEST_CROSS").is_ok_and(|v| v.split(',').any(|a| a == "aarch64"))
     {
         assert_eq!(
             decode_insn_with_objdump(&[0xe3, 0x93, 0x44, 0xa9], 0x1000).unwrap(),
@@ -205,12 +207,12 @@ impl Arch for AArch64 {
         String::new()
     }
 
-    fn decode_instructions_in_range(
-        section_bytes: &[u8],
+    fn decode_instructions_in_range<'data>(
+        section_bytes: &'data [u8],
         section_address: u64,
         _function_offset_in_section: u64,
         range: std::ops::Range<u64>,
-    ) -> Vec<crate::arch::Instruction<Self>> {
+    ) -> Vec<crate::arch::Instruction<'data, Self>> {
         let mut offset = range.start & !3;
 
         let mut instructions = Vec::new();
@@ -327,6 +329,10 @@ impl Arch for AArch64 {
             _ => true,
         }
     }
+
+    fn get_basic_value_for_tp_offset() -> crate::asm_diff::BasicValueKind {
+        BasicValueKind::Aarch64TlsOffset
+    }
 }
 
 const CHAINS: &[&[RType]] = &[
@@ -363,14 +369,22 @@ const CHAINS: &[&[RType]] = &[
 ];
 
 const REL_ADR_PAGE: BitMask = BitMask::new(
-    RelocationInstruction::Adr,
+    RelocationInstruction::AArch64(AArch64Instruction::Adr),
     DEFAULT_AARCH64_PAGE_SIZE_BITS as u32,
     DEFAULT_AARCH64_PAGE_SIZE_BITS as u32 + 21,
 );
 
-const REL_LDR_OFFSET: BitMask = BitMask::new(RelocationInstruction::LdrRegister, 3, 3 + 12);
+const REL_LDR_OFFSET: BitMask = BitMask::new(
+    RelocationInstruction::AArch64(AArch64Instruction::LdrRegister),
+    3,
+    3 + 12,
+);
 
-const REL_ADD_LITERAL: BitMask = BitMask::new(RelocationInstruction::Add, 0, 12);
+const REL_ADD_LITERAL: BitMask = BitMask::new(
+    RelocationInstruction::AArch64(AArch64Instruction::Add),
+    0,
+    12,
+);
 
 fn decode_plt_entry_template_1(
     plt_entry: &[u8],
