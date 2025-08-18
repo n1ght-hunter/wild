@@ -1,0 +1,13 @@
+[package]
+name = "wlibwild"
+repository.workspace = true
+license.workspace = true
+version.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

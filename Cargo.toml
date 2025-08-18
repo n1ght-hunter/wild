@@ -6,6 +6,7 @@ members = [
     "linker-utils",
     "wild",
     "libwild",
+    "windows/wlibwild",
 ]
 resolver = "2"
 
