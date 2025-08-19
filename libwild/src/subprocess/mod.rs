@@ -3,14 +3,12 @@ mod linux;
 #[cfg(target_os = "windows")]
 mod windows;
 
-#[cfg(target_os = "linux")]
-pub use linux::run_in_subprocess;
-
-#[cfg(target_os = "windows")]
-pub use windows::run_in_subprocess;
-
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub use dummy::run_in_subprocess;
+#[cfg(target_os = "linux")]
+pub use linux::run_in_subprocess;
+#[cfg(target_os = "windows")]
+pub use windows::run_in_subprocess;
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 mod dummy {

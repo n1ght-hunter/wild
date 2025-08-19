@@ -1,11 +1,13 @@
-use std::{io::Write, path::PathBuf};
-
-use object::{
-    LittleEndian as LE,
-    coff::{CoffHeader, SectionTable, SymbolTable},
-    pe::ImageFileHeader,
-};
-use tracing::{debug, info, warn};
+use object::LittleEndian as LE;
+use object::coff::CoffHeader;
+use object::coff::SectionTable;
+use object::coff::SymbolTable;
+use object::pe::ImageFileHeader;
+use std::io::Write;
+use std::path::PathBuf;
+use tracing::debug;
+use tracing::info;
+use tracing::warn;
 
 pub fn run() {
     let files = vec![

@@ -1,20 +1,27 @@
-use crate::{Args, bail, error::Result};
-use phnt::{
-    ffi::{
-        HANDLE, NtClose, NtCreateUserProcess, NtTerminateProcess, NtWaitForSingleObject,
-        PROCESS_CREATE_FLAGS_INHERIT_HANDLES, PS_CREATE_INFO, ULONG_PTR,
-    },
-};
+use crate::Args;
+use crate::bail;
+use crate::error::Result;
+use phnt::ffi::HANDLE;
+use phnt::ffi::NtClose;
+use phnt::ffi::NtCreateUserProcess;
+use phnt::ffi::NtTerminateProcess;
+use phnt::ffi::NtWaitForSingleObject;
+use phnt::ffi::PROCESS_CREATE_FLAGS_INHERIT_HANDLES;
+use phnt::ffi::PS_CREATE_INFO;
+use phnt::ffi::ULONG_PTR;
 use std::ptr;
-use windows_sys::Win32::{
-    Foundation::{CloseHandle, FALSE, STATUS_PROCESS_CLONED, TRUE},
-    Storage::FileSystem::{ReadFile, WriteFile},
-    System::{
-        Console::{ATTACH_PARENT_PROCESS, AttachConsole, FreeConsole},
-        Pipes::CreatePipe,
-        Threading::{PROCESS_ALL_ACCESS, THREAD_ALL_ACCESS},
-    },
-};
+use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Foundation::FALSE;
+use windows_sys::Win32::Foundation::STATUS_PROCESS_CLONED;
+use windows_sys::Win32::Foundation::TRUE;
+use windows_sys::Win32::Storage::FileSystem::ReadFile;
+use windows_sys::Win32::Storage::FileSystem::WriteFile;
+use windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS;
+use windows_sys::Win32::System::Console::AttachConsole;
+use windows_sys::Win32::System::Console::FreeConsole;
+use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::Threading::PROCESS_ALL_ACCESS;
+use windows_sys::Win32::System::Threading::THREAD_ALL_ACCESS;
 
 pub unsafe fn run_in_subprocess(args: Args) -> ! {
     let exit_code = match subprocess_result(args) {
