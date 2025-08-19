@@ -8,13 +8,70 @@ use std::path::PathBuf;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
+mod subprocess;
+use tracing_subscriber::{
+    Layer as _, fmt::format::FmtSpan, layer::SubscriberExt as _, util::SubscriberInitExt,
+};
 
-pub fn run() {
-    let files = vec![
-        PathBuf::from("basic_objs/function.o"),
-        PathBuf::from("basic_objs/main.o"),
-    ];
-    link_files(files).unwrap();
+pub fn setup_logging() {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_line_number(true)
+                .with_file(true)
+                .with_span_events(FmtSpan::CLOSE)
+                .with_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or("wlibwild=info,warn".into()),
+                ),
+        )
+        .init();
+}
+
+pub struct Linker;
+
+impl Linker {
+    pub fn new() -> Self {
+        Linker
+    }
+
+    pub fn run(&self) -> anyhow::Result<LinkerDrop> {
+        // This is where the linking logic would go
+        info!("Linker is running");
+        let files = vec![
+            PathBuf::from("basic_objs/function.o"),
+            PathBuf::from("basic_objs/main.o"),
+        ];
+        link_files(files).unwrap();
+
+        Ok(LinkerDrop)
+    }
+}
+
+pub struct LinkerDrop;
+
+impl Drop for LinkerDrop {
+    fn drop(&mut self) {
+        info!("Linker has finished running");
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        std::fs::write(
+            "./done.txzt",
+            format!(
+                "Linker has finished running at {:#?}",
+                std::time::SystemTime::now()
+            ),
+        )
+        .expect("Failed to write done file");
+    }
+}
+
+pub use subprocess::run_in_subprocess;
+
+pub fn run() -> Result<(), anyhow::Error> {
+    let linker = Linker::new();
+
+    linker.run()?;
+    Ok(())
 }
 
 fn link_files(files: Vec<PathBuf>) -> anyhow::Result<()> {
