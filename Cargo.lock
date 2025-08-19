@@ -416,6 +416,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "displaydoc"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97369cbbc041bc366949bc74d34658d6cda5621039731c6310521892a3a20ae0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -751,7 +762,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "windows-sys 0.60.2",
  "winnow",
  "zstd",
 ]
@@ -899,6 +909,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nt-string"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f64f73b19d9405e886b53b9dee286e7fbb622a5276a7fd143c2d8e4dac3a0c6c"
+dependencies = [
+ "displaydoc",
+ "widestring",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1002,6 +1022,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c44fb1c7651a45a3652c4afc6e754e40b3d6e6556f1487e2b230bfc4f33c2a8"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "phnt"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a88b858d3d129dd19de9bd1e4318b20753f2c92bea944fc0fb2728e444bf5f44"
+dependencies = [
+ "nt-string",
+ "quote",
+ "syn",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1716,6 +1748,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "widestring"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd7cf3379ca1aac9eea11fba24fd7e315d621f8dfe35c8d7d2be8b793726e07d"
+
+[[package]]
 name = "wild-linker"
 version = "0.5.0"
 dependencies = [
@@ -1951,9 +1989,11 @@ dependencies = [
  "indexmap",
  "itertools",
  "object 0.37.3",
+ "phnt",
  "rayon",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
