@@ -22,6 +22,19 @@ use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::PROCESS_ALL_ACCESS;
 use windows_sys::Win32::System::Threading::THREAD_ALL_ACCESS;
 
+
+/// Runs the linker, in a subprocess if possible, prints any errors, then exits.
+///
+/// This is done by forking a sub-process which runs the linker and waits for communication back
+/// from the sub-process (via a pipe) when the main link task is done (the output file has been
+/// written, but some shutdown tasks remain.
+///
+/// Don't call `setup_tracing` or `setup_thread_pool` if using this function, these will be called
+/// for you in the subprocess.
+///
+/// # Safety
+/// Must not be called once threads have been spawned. Calling this function from main is generally
+/// the best way to ensure this.
 pub unsafe fn run_in_subprocess(args: Args) -> ! {
     let exit_code = match subprocess_result(args) {
         Ok(code) => code,
