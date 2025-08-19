@@ -26,6 +26,7 @@ pub(crate) mod output_section_id;
 pub(crate) mod output_section_map;
 pub(crate) mod output_section_part_map;
 pub(crate) mod output_trace;
+pub(crate) mod target_os;
 pub(crate) mod parsing;
 pub(crate) mod part_id;
 #[cfg(target_os = "linux")]
