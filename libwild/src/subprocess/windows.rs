@@ -8,7 +8,6 @@ use phnt::ffi::NtTerminateProcess;
 use phnt::ffi::NtWaitForSingleObject;
 use phnt::ffi::PROCESS_CREATE_FLAGS_INHERIT_HANDLES;
 use phnt::ffi::PS_CREATE_INFO;
-use phnt::ffi::ULONG_PTR;
 use std::ptr;
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::FALSE;
@@ -87,31 +86,30 @@ fn inform_parent_done(write_end: HANDLE) {
 }
 
 fn wait_for_child_done(read_end: HANDLE, hprocess: HANDLE, hthread: HANDLE) -> i32 {
-    unsafe {
-        let mut response: [u8; 1] = [0u8; 1];
-        let mut bytes_read = 0;
-        match ReadFile(
+    let mut response: [u8; 1] = [0u8; 1];
+    let mut bytes_read = 0;
+    match unsafe {
+        ReadFile(
             read_end,
             response.as_mut_ptr(),
             1,
             &mut bytes_read,
             std::ptr::null_mut(),
-        ) {
-            TRUE => {
-                // Child sent a byte, which indicates that it succeeded and is now shutting down in
-                // the background.
-                0
-            }
-            _ => {
-                // Child closed pipe without sending a byte - get the process exit_status
-                let status =
-                    unsafe { NtWaitForSingleObject(hprocess, FALSE as _, ptr::null_mut()) };
-                unsafe {
-                    NtClose(hprocess);
-                    NtClose(hthread);
-                };
-                status
-            }
+        )
+    } {
+        TRUE => {
+            // Child sent a byte, which indicates that it succeeded and is now shutting down in
+            // the background.
+            0
+        }
+        _ => {
+            // Child closed pipe without sending a byte - get the process exit_status
+            let status = unsafe { NtWaitForSingleObject(hprocess, FALSE as _, ptr::null_mut()) };
+            unsafe {
+                NtClose(hprocess);
+                NtClose(hthread);
+            };
+            status
         }
     }
 }
