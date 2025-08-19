@@ -39,10 +39,7 @@ pub(crate) mod riscv64;
 pub(crate) mod save_dir;
 pub(crate) mod sharding;
 pub(crate) mod string_merging;
-#[cfg(all(feature = "fork", not(target_os = "windows")))]
-pub(crate) mod subprocess;
-#[cfg(any(not(feature = "fork"), target_os = "windows"))]
-#[path = "subprocess_unsupported.rs"]
+#[cfg(feature = "fork")]
 pub(crate) mod subprocess;
 pub(crate) mod symbol;
 pub(crate) mod symbol_db;
