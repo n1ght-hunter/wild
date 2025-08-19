@@ -13,6 +13,7 @@ use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::FALSE;
 use windows_sys::Win32::Foundation::STATUS_PROCESS_CLONED;
 use windows_sys::Win32::Foundation::TRUE;
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::ReadFile;
 use windows_sys::Win32::Storage::FileSystem::WriteFile;
 use windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS;
@@ -21,7 +22,6 @@ use windows_sys::Win32::System::Console::FreeConsole;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::PROCESS_ALL_ACCESS;
 use windows_sys::Win32::System::Threading::THREAD_ALL_ACCESS;
-
 
 /// Runs the linker, in a subprocess if possible, prints any errors, then exits.
 ///
@@ -151,7 +151,14 @@ unsafe fn fork(hprocess: &mut HANDLE, hthread: &mut HANDLE) -> i32 {
 fn make_pipe() -> Result<(HANDLE, HANDLE)> {
     let mut read_end: HANDLE = std::ptr::null_mut();
     let mut write_end: HANDLE = std::ptr::null_mut();
-    match unsafe { CreatePipe(&mut read_end, &mut write_end, std::ptr::null_mut(), 0) } {
+
+    let security_attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: TRUE, // The crucial part!
+    };
+
+    match unsafe { CreatePipe(&mut read_end, &mut write_end, &security_attributes, 0) } {
         TRUE => Ok((read_end, write_end)),
         _ => bail!(
             "Error creating pipe. Errno = {:?}",
