@@ -1,12 +1,143 @@
-/// # Safety
-/// See function of the same name in `subprocess.rs`
-pub unsafe fn run_in_subprocess(args: crate::Args) -> ! {
-    let exit_code = match crate::run(args) {
-        Ok(()) => 0,
-        Err(error) => {
-            eprintln!("{}", error.to_string());
-            -1
-        }
+use crate::{Args, bail, error::Result};
+use phnt::{
+    ffi::{
+        HANDLE, NtClose, NtCreateUserProcess, NtTerminateProcess, NtWaitForSingleObject,
+        PROCESS_CREATE_FLAGS_INHERIT_HANDLES, PS_CREATE_INFO, ULONG_PTR,
+    },
+};
+use std::ptr;
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, FALSE, STATUS_PROCESS_CLONED, TRUE},
+    Storage::FileSystem::{ReadFile, WriteFile},
+    System::{
+        Console::{ATTACH_PARENT_PROCESS, AttachConsole, FreeConsole},
+        Pipes::CreatePipe,
+        Threading::{PROCESS_ALL_ACCESS, THREAD_ALL_ACCESS},
+    },
+};
+
+pub unsafe fn run_in_subprocess(args: Args) -> ! {
+    let exit_code = match subprocess_result(args) {
+        Ok(code) => code,
+        Err(error) => crate::error::report_error_and_exit(&error),
     };
     std::process::exit(exit_code);
+}
+
+#[allow(non_upper_case_globals)]
+pub const NtCurrentProcess: HANDLE = -1isize as *mut std::ffi::c_void;
+
+fn subprocess_result(args: Args) -> Result<i32> {
+    let (read_end, write_end) = make_pipe()?;
+
+    let mut hprocess: HANDLE = std::ptr::null_mut();
+    let mut hthread: HANDLE = std::ptr::null_mut();
+
+    match unsafe { fork(&mut hprocess, &mut hthread) } {
+        STATUS_PROCESS_CLONED => {
+            // executing inside the clone
+
+            // re attach to the parent's console to be able to write to it
+            unsafe {
+                FreeConsole();
+                AttachConsole(ATTACH_PARENT_PROCESS);
+            };
+
+            crate::setup_tracing(&args)?;
+            let args = args.activate_thread_pool()?;
+            let linker = crate::Linker::new();
+            let _outputs = linker.run(&args)?;
+            inform_parent_done(write_end);
+            unsafe { NtTerminateProcess(NtCurrentProcess, STATUS_PROCESS_CLONED) };
+            Ok(0)
+        }
+        0 => {
+            let exit_status = wait_for_child_done(read_end, hprocess, hthread);
+            Ok(exit_status)
+        }
+        _ => {
+            // Fork failure in the parent - Fallback to running linker in this process
+            crate::run(args)?;
+            Ok(0)
+        }
+    }
+}
+
+fn inform_parent_done(write_end: HANDLE) {
+    let mut bytes_written = 0;
+
+    unsafe {
+        WriteFile(
+            write_end,
+            "X".as_ptr(),
+            1,
+            &mut bytes_written,
+            std::ptr::null_mut(),
+        );
+        CloseHandle(write_end);
+        FreeConsole();
+    }
+}
+
+fn wait_for_child_done(read_end: HANDLE, hprocess: HANDLE, hthread: HANDLE) -> i32 {
+    unsafe {
+        let mut response: [u8; 1] = [0u8; 1];
+        let mut bytes_read = 0;
+        match ReadFile(
+            read_end,
+            response.as_mut_ptr(),
+            1,
+            &mut bytes_read,
+            std::ptr::null_mut(),
+        ) {
+            TRUE => {
+                // Child sent a byte, which indicates that it succeeded and is now shutting down in
+                // the background.
+                0
+            }
+            _ => {
+                // Child closed pipe without sending a byte - get the process exit_status
+                let status =
+                    unsafe { NtWaitForSingleObject(hprocess, FALSE as _, ptr::null_mut()) };
+                unsafe {
+                    NtClose(hprocess);
+                    NtClose(hthread);
+                };
+                status
+            }
+        }
+    }
+}
+
+unsafe fn fork(hprocess: &mut HANDLE, hthread: &mut HANDLE) -> i32 {
+    let mut create_info: PS_CREATE_INFO = unsafe { std::mem::zeroed() };
+    create_info.Size = std::mem::size_of::<PS_CREATE_INFO>() as _;
+
+    unsafe {
+        NtCreateUserProcess(
+            hprocess,
+            hthread,
+            PROCESS_ALL_ACCESS,
+            THREAD_ALL_ACCESS,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            PROCESS_CREATE_FLAGS_INHERIT_HANDLES,
+            0,
+            std::ptr::null_mut(),
+            &mut create_info,
+            std::ptr::null_mut(),
+        )
+    }
+}
+
+fn make_pipe() -> Result<(HANDLE, HANDLE)> {
+    let mut read_end: HANDLE = std::ptr::null_mut();
+    let mut write_end: HANDLE = std::ptr::null_mut();
+    match unsafe { CreatePipe(&mut read_end, &mut write_end, std::ptr::null_mut(), 0) } {
+        TRUE => Ok((read_end, write_end)),
+        _ => bail!(
+            "Error creating pipe. Errno = {:?}",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        ),
+    }
 }
