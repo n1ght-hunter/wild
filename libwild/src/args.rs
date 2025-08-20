@@ -729,7 +729,7 @@ fn warn_unsupported(opt: &str) -> Result {
     Ok(())
 }
 
-struct ArgumentParser {
+pub struct ArgumentParser {
     options: HashMap<&'static str, OptionHandler>,
     short_options: HashMap<&'static str, OptionHandler>, // Short option lookup
     prefix_options: HashMap<&'static str, PrefixOptionHandler>, // For options like -L, -l, etc.
@@ -756,7 +756,7 @@ enum OptionHandlerFn {
     OptionalParam(fn(&mut Args, &mut Vec<Modifiers>, Option<&str>) -> Result<()>),
 }
 
-struct OptionDeclaration<'a, T> {
+pub struct OptionDeclaration<'a, T> {
     parser: &'a mut ArgumentParser,
     long_names: Vec<&'static str>,
     short_names: Vec<&'static str>,
@@ -766,9 +766,9 @@ struct OptionDeclaration<'a, T> {
     _phantom: std::marker::PhantomData<T>,
 }
 
-struct NoParam;
-struct WithParam;
-struct WithOptionalParam;
+pub struct NoParam;
+pub struct WithParam;
+pub struct WithOptionalParam;
 
 #[derive(Clone, Copy)]
 struct SubOption {
@@ -784,7 +784,7 @@ impl Default for ArgumentParser {
 
 impl ArgumentParser {
     #[must_use]
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             options: HashMap::new(),
             short_options: HashMap::new(),
@@ -792,7 +792,7 @@ impl ArgumentParser {
         }
     }
 
-    fn declare(&mut self) -> OptionDeclaration<'_, NoParam> {
+    pub fn declare(&mut self) -> OptionDeclaration<'_, NoParam> {
         OptionDeclaration {
             parser: self,
             long_names: Vec::new(),
@@ -804,7 +804,7 @@ impl ArgumentParser {
         }
     }
 
-    fn declare_with_param(&mut self) -> OptionDeclaration<'_, WithParam> {
+    pub fn declare_with_param(&mut self) -> OptionDeclaration<'_, WithParam> {
         OptionDeclaration {
             parser: self,
             long_names: Vec::new(),
@@ -816,7 +816,7 @@ impl ArgumentParser {
         }
     }
 
-    fn declare_with_optional_param(&mut self) -> OptionDeclaration<'_, WithOptionalParam> {
+    pub fn declare_with_optional_param(&mut self) -> OptionDeclaration<'_, WithOptionalParam> {
         OptionDeclaration {
             parser: self,
             long_names: Vec::new(),
@@ -1044,30 +1044,30 @@ impl ArgumentParser {
 
 impl<'a, T> OptionDeclaration<'a, T> {
     #[must_use]
-    fn long(mut self, name: &'static str) -> Self {
+    pub fn long(mut self, name: &'static str) -> Self {
         self.long_names.push(name);
         self
     }
 
     #[must_use]
-    fn short(mut self, option: &'static str) -> Self {
+    pub fn short(mut self, option: &'static str) -> Self {
         self.short_names.push(option);
         self
     }
 
     #[must_use]
-    fn help(mut self, text: &'static str) -> Self {
+    pub fn help(mut self, text: &'static str) -> Self {
         self.help_text = text;
         self
     }
 
-    fn prefix(mut self, prefix: &'static str) -> Self {
+    pub fn prefix(mut self, prefix: &'static str) -> Self {
         self.prefixes.push(prefix);
         self
     }
 
     #[must_use]
-    fn sub_option(
+    pub fn sub_option(
         mut self,
         name: &'static str,
         help: &'static str,
@@ -1079,7 +1079,7 @@ impl<'a, T> OptionDeclaration<'a, T> {
 }
 
 impl<'a> OptionDeclaration<'a, NoParam> {
-    fn execute(self, handler: fn(&mut Args, &mut Vec<Modifiers>) -> Result<()>) {
+    pub fn execute(self, handler: fn(&mut Args, &mut Vec<Modifiers>) -> Result<()>) {
         let option_handler = OptionHandler {
             help_text: self.help_text,
             handler: OptionHandlerFn::NoParam(handler),
@@ -1099,7 +1099,7 @@ impl<'a> OptionDeclaration<'a, NoParam> {
 }
 
 impl<'a> OptionDeclaration<'a, WithParam> {
-    fn execute(self, handler: fn(&mut Args, &mut Vec<Modifiers>, &str) -> Result<()>) {
+    pub fn execute(self, handler: fn(&mut Args, &mut Vec<Modifiers>, &str) -> Result<()>) {
         let mut short_names = self.short_names.clone();
         short_names.extend_from_slice(&self.prefixes);
 
@@ -1132,7 +1132,7 @@ impl<'a> OptionDeclaration<'a, WithParam> {
 }
 
 impl<'a> OptionDeclaration<'a, WithOptionalParam> {
-    fn execute(self, handler: fn(&mut Args, &mut Vec<Modifiers>, Option<&str>) -> Result<()>) {
+    pub fn execute(self, handler: fn(&mut Args, &mut Vec<Modifiers>, Option<&str>) -> Result<()>) {
         let option_handler = OptionHandler {
             help_text: self.help_text,
             handler: OptionHandlerFn::OptionalParam(handler),
